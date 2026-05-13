@@ -1,12 +1,12 @@
-# Watermark Evaluation Results
+# VLA Watermark Evaluation Results
 
-| Env    | Gen Method        | Trigger        | TPR     | FPR    | AUC   | Clean SR | WM SR   | Path Len (clean) | Path Len (wm) | Act Dev | TPR@noise0.05 | TPR@noise0.1 | TPR@noise0.2 |
-| ------ | ----------------- | -------------- | ------- | ------ | ----- | -------- | ------- | ---------------- | ------------- | ------- | ------------- | ------------ | ------------ |
-| vmas   | watermark_wrapper | semantic       | 50.00%  | 20.00% | 0.580 | 100.00%  | 100.00% | 2.85             | 3.63          | 1.3999  | 50.00%        | 50.00%       | 50.00%       |
-| vmas   | watermark_wrapper | neuro_symbolic | 50.00%  | 20.00% | 0.580 | 100.00%  | 100.00% | 2.85             | 3.63          | 1.3999  | 50.00%        | 50.00%       | 50.00%       |
-| vmas   | stainlock         | semantic       | 0.00%   | 20.00% | 0.340 | 100.00%  | 90.00%  | 2.85             | 5.12          | 1.1666  | 0.00%         | 0.00%        | 0.00%        |
-| vmas   | stainlock         | neuro_symbolic | 0.00%   | 20.00% | 0.340 | 100.00%  | 90.00%  | 2.85             | 5.12          | 1.1666  | 0.00%         | 0.00%        | 0.00%        |
-| libero | watermark_wrapper | semantic       | 100.00% | 20.00% | 0.800 | 100.00%  | 100.00% | 0.67             | 1.04          | 0.0622  | 100.00%       | 100.00%      | 100.00%      |
-| libero | watermark_wrapper | neuro_symbolic | 100.00% | 20.00% | 0.800 | 100.00%  | 100.00% | 0.67             | 1.04          | 0.0622  | 100.00%       | 100.00%      | 100.00%      |
-| libero | stainlock         | semantic       | 100.00% | 20.00% | 0.800 | 100.00%  | 0.00%   | 0.67             | 3.32          | 0.3277  | 100.00%       | 100.00%      | 100.00%      |
-| libero | stainlock         | neuro_symbolic | 100.00% | 20.00% | 0.800 | 100.00%  | 0.00%   | 0.67             | 3.32          | 0.3277  | 100.00%       | 100.00%      | 100.00%      |
+| Env    | Gen Method        | Trigger        | Clean SR | WM SR | Act Dev | TPR(clean) | TPR(txt-only) | TPR(vis-only) | TPR(full) | AUC(full) | COS(full) |
+| ------ | ----------------- | -------------- | -------- | ----- | ------- | ---------- | ------------- | ------------- | --------- | --------- | --------- |
+| vmas   | watermark_wrapper | semantic       | 1.000    | 1.000 | 0.103   | 0.300      | 0.200         | 0.300         | 0.700     | 0.780     | -0.015    |
+| vmas   | watermark_wrapper | neuro_symbolic | 1.000    | 1.000 | 0.051   | 0.300      | 0.200         | 0.300         | 0.300     | 0.480     | -0.103    |
+| libero | watermark_wrapper | semantic       | 1.000    | 1.000 | 0.024   | 0.100      | 0.100         | 0.100         | 1.000     | 0.800     | 0.054     |
+| libero | watermark_wrapper | neuro_symbolic | 1.000    | 1.000 | 0.022   | 0.100      | 0.100         | 0.100         | 0.100     | 0.380     | 0.042     |
+| vmas   | stainlock         | semantic       | 1.000    | 0.800 | 0.534   | 0.200      | 0.300         | 0.200         | 0.000     | 0.160     | 0.000     |
+| vmas   | stainlock         | neuro_symbolic | 1.000    | 1.000 | 0.051   | 0.200      | 0.300         | 0.200         | 0.200     | 0.440     | 0.000     |
+| libero | stainlock         | semantic       | 1.000    | 0.000 | 0.388   | 0.100      | 0.100         | 0.100         | 1.000     | 0.800     | 0.000     |
+| libero | stainlock         | neuro_symbolic | 1.000    | 1.000 | 0.022   | 0.100      | 0.100         | 0.100         | 0.000     | 0.370     | 0.000     |

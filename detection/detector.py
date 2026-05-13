@@ -2,18 +2,21 @@
 
 Detection pipeline
 ------------------
-1. Collect N *clean* trajectories to build a reference distribution of
-   action sequences.
-2. For each *test* trajectory compute the **residual** w.r.t. the
-   reference mean:  r_t = a_t − ā_t
-3. Compute a **detection score** via:
-   a) Correlation with the known watermark template (if available).
-   b) Z-score:  z = (mean_action − μ_ref) / σ_ref
-4. Threshold the score to produce a binary decision.
-5. Sweep the threshold over a population of clean + watermarked
-   trajectories to compute TPR / FPR curves.
+1. Collect N *clean* trajectories → build a reference action distribution.
+2. For each *test* trajectory compute:
 
-All methods are self-contained, pure-numpy.
+   a) Cosine similarity with known watermark template (PRIMARY):
+          score_cos = (a_flat · S_flat) / (‖a_flat‖ · ‖S_flat‖)
+      The circular signature S is nearly orthogonal to random actions,
+      so E[score_cos | clean] ≈ 0 and E[score_cos | watermarked] > 0.
+
+   b) Z-score (SECONDARY):
+          z = ‖(ā - μ_ref) / σ_ref‖₂
+      where ā = mean action over the trajectory.
+
+3. Combine: score = 0.7 · score_cos·scale + 0.3 · z_score
+
+4. Threshold → binary decision; sweep → TPR / FPR / AUC curve.
 """
 from __future__ import annotations
 
@@ -23,25 +26,25 @@ from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Result container
+# Result containers
 # ---------------------------------------------------------------------------
 
 @dataclass
 class DetectionResult:
     """Per-trajectory detection outcome."""
-    score: float                        # raw detection score
-    z_score: float                      # normalised z-score
-    detected: bool                      # binary decision
-    corr_score: float = 0.0             # template correlation (if available)
-    residual_norm: float = 0.0          # L2 norm of mean residual
+    score:          float
+    cos_score:      float    # cosine similarity with template (PRIMARY)
+    z_score:        float    # z-score of mean action
+    detected:       bool
+    residual_norm:  float = 0.0
     trajectory_length: int = 0
 
     def to_dict(self) -> Dict:
         return {
             "score": self.score,
+            "cos_score": self.cos_score,
             "z_score": self.z_score,
             "detected": self.detected,
-            "corr_score": self.corr_score,
             "residual_norm": self.residual_norm,
             "trajectory_length": self.trajectory_length,
         }
@@ -50,63 +53,48 @@ class DetectionResult:
 @dataclass
 class PopulationDetectionResult:
     """Aggregate detection results over a population of trajectories."""
-    clean_scores: np.ndarray = field(default_factory=lambda: np.array([]))
-    wm_scores: np.ndarray = field(default_factory=lambda: np.array([]))
-    threshold: float = 0.0
-    tpr: float = 0.0
-    fpr: float = 0.0
-    auc: float = 0.0
+    clean_scores:   np.ndarray = field(default_factory=lambda: np.array([]))
+    wm_scores:      np.ndarray = field(default_factory=lambda: np.array([]))
+    clean_cos:      np.ndarray = field(default_factory=lambda: np.array([]))
+    wm_cos:         np.ndarray = field(default_factory=lambda: np.array([]))
     clean_z_scores: np.ndarray = field(default_factory=lambda: np.array([]))
-    wm_z_scores: np.ndarray = field(default_factory=lambda: np.array([]))
+    wm_z_scores:    np.ndarray = field(default_factory=lambda: np.array([]))
+    threshold: float = 0.0
+    tpr:       float = 0.0
+    fpr:       float = 0.0
+    auc:       float = 0.0
 
     def to_dict(self) -> Dict:
+        cs_mean = float(self.clean_scores.mean()) if len(self.clean_scores) else 0.0
+        wm_mean = float(self.wm_scores.mean())    if len(self.wm_scores)    else 0.0
         return {
-            "threshold": self.threshold,
-            "tpr": self.tpr,
-            "fpr": self.fpr,
-            "auc": self.auc,
-            "clean_score_mean": float(self.clean_scores.mean()) if len(self.clean_scores) else 0.0,
+            "threshold":        self.threshold,
+            "tpr":              self.tpr,
+            "fpr":              self.fpr,
+            "auc":              self.auc,
+            "clean_score_mean": cs_mean,
             "clean_score_std":  float(self.clean_scores.std())  if len(self.clean_scores) else 0.0,
-            "wm_score_mean":    float(self.wm_scores.mean())    if len(self.wm_scores)    else 0.0,
+            "wm_score_mean":    wm_mean,
             "wm_score_std":     float(self.wm_scores.std())     if len(self.wm_scores)    else 0.0,
+            "clean_cos_mean":   float(self.clean_cos.mean())    if len(self.clean_cos)    else 0.0,
+            "wm_cos_mean":      float(self.wm_cos.mean())       if len(self.wm_cos)       else 0.0,
             "clean_z_mean":     float(self.clean_z_scores.mean()) if len(self.clean_z_scores) else 0.0,
             "wm_z_mean":        float(self.wm_z_scores.mean())    if len(self.wm_z_scores)    else 0.0,
         }
 
 
 # ---------------------------------------------------------------------------
-# Reference distribution builder
+# Reference distribution
 # ---------------------------------------------------------------------------
 
 class ReferenceDistribution:
-    """
-    Estimates action mean and std from a set of clean trajectories.
-
-    Trajectories may have different lengths; we align by truncating to
-    min_length and then computing per-timestep statistics.
-    """
-
     def __init__(self) -> None:
-        self.mean: Optional[np.ndarray] = None   # (T, action_dim)
-        self.std: Optional[np.ndarray] = None    # (T, action_dim)
-        self.global_mean: Optional[np.ndarray] = None  # (action_dim,)
-        self.global_std: Optional[np.ndarray] = None   # (action_dim,)
-        self._fitted: bool = False
+        self.global_mean: Optional[np.ndarray] = None
+        self.global_std:  Optional[np.ndarray] = None
+        self._fitted = False
 
     def fit(self, trajectories: List[np.ndarray]) -> "ReferenceDistribution":
-        """
-        trajectories: list of (T_i, action_dim) arrays from clean runs.
-        """
-        if not trajectories:
-            raise ValueError("Need at least one trajectory to fit reference.")
-
-        min_T = min(t.shape[0] for t in trajectories)
-        stack = np.stack([t[:min_T] for t in trajectories], axis=0)  # (N, T, D)
-
-        self.mean = stack.mean(axis=0)      # (T, D)
-        self.std  = stack.std(axis=0) + 1e-8
-
-        flat = stack.reshape(-1, stack.shape[-1])
+        flat = np.concatenate([t.reshape(-1, t.shape[-1]) for t in trajectories], axis=0)
         self.global_mean = flat.mean(axis=0)
         self.global_std  = flat.std(axis=0) + 1e-8
         self._fitted = True
@@ -123,15 +111,13 @@ class ReferenceDistribution:
 
 class TrajectoryDetector:
     """
-    Detect watermarked trajectories using residual correlation and z-score.
+    Detect watermarked trajectories using cosine correlation and z-score.
 
     Parameters
     ----------
-    reference_trajectories : list of clean action arrays (T, D) – used to
-                             build the reference distribution
-    watermark_template     : (T_wm, D) expected watermark delta (optional)
-                             – enables template-correlation scoring
-    threshold              : detection score threshold (default auto-fit)
+    reference_trajectories : list of clean (T, D) action arrays
+    watermark_template     : (T_wm, D) circular watermark signature
+    threshold              : detection threshold (None → auto-fit)
     """
 
     def __init__(
@@ -147,84 +133,62 @@ class TrajectoryDetector:
         if reference_trajectories:
             self.fit_reference(reference_trajectories)
 
-    # ------------------------------------------------------------------
-    # Fitting
-    # ------------------------------------------------------------------
-
     def fit_reference(self, trajectories: List[np.ndarray]) -> None:
-        """Fit reference distribution from clean trajectories."""
         self.ref.fit(trajectories)
 
     def auto_threshold(
         self,
         clean_scores: np.ndarray,
-        wm_scores: Optional[np.ndarray] = None,
         target_fpr: float = 0.05,
     ) -> float:
-        """Set threshold at the (1 - target_fpr) quantile of clean scores."""
-        threshold = float(np.quantile(clean_scores, 1.0 - target_fpr))
-        self._threshold = threshold
-        return threshold
+        self._threshold = float(np.quantile(clean_scores, 1.0 - target_fpr))
+        return self._threshold
 
     # ------------------------------------------------------------------
     # Per-trajectory scoring
     # ------------------------------------------------------------------
 
     def score(self, action_trajectory: np.ndarray) -> DetectionResult:
-        """
-        action_trajectory: (T, action_dim)
-        Returns DetectionResult with all scores populated.
-        """
+        """action_trajectory: (T, D) → DetectionResult"""
         T, D = action_trajectory.shape
 
-        # --- Z-score based on global action distribution ---
-        if self.ref.is_fitted:
-            traj_mean = action_trajectory.mean(axis=0)  # (D,)
-            z_vec = (traj_mean - self.ref.global_mean) / self.ref.global_std
-            z_score = float(np.linalg.norm(z_vec))
-
-            # Residual from per-timestep mean
-            T_ref = self.ref.mean.shape[0]
-            T_use = min(T, T_ref)
-            residuals = action_trajectory[:T_use] - self.ref.mean[:T_use]
-            residual_norm = float(np.linalg.norm(residuals.mean(axis=0)))
-        else:
-            z_score = float(np.linalg.norm(action_trajectory.mean(axis=0)))
-            residuals = action_trajectory
-            residual_norm = float(np.linalg.norm(action_trajectory.mean(axis=0)))
-
-        # --- Template correlation (if template provided) ---
-        corr_score = 0.0
+        # --- Cosine similarity with watermark template (PRIMARY) ---
+        cos_score = 0.0
         if self.watermark_template is not None:
             T_tm = self.watermark_template.shape[0]
             T_use = min(T, T_tm)
-            seg = action_trajectory[:T_use].flatten()
-            tmpl = self.watermark_template[:T_use].flatten()
-            norm_s = np.linalg.norm(seg) + 1e-9
-            norm_t = np.linalg.norm(tmpl) + 1e-9
-            corr_score = float(np.dot(seg / norm_s, tmpl / norm_t))
+            a_seg   = action_trajectory[:T_use].flatten()
+            t_seg   = self.watermark_template[:T_use].flatten()
+            norm_a  = np.linalg.norm(a_seg) + 1e-9
+            norm_t  = np.linalg.norm(t_seg) + 1e-9
+            cos_score = float(np.dot(a_seg / norm_a, t_seg / norm_t))
 
-        # --- Composite detection score ---
-        # Weight: 60% z-score magnitude, 40% template correlation
-        if self.watermark_template is not None:
-            raw_score = 0.6 * z_score + 0.4 * max(corr_score, 0.0) * 10.0
+        # --- Z-score of mean action (SECONDARY) ---
+        if self.ref.is_fitted:
+            traj_mean = action_trajectory.mean(axis=0)
+            z_vec     = (traj_mean - self.ref.global_mean) / self.ref.global_std
+            z_score   = float(np.linalg.norm(z_vec))
+            residual_norm = z_score
         else:
-            raw_score = z_score + residual_norm
+            z_score = float(np.linalg.norm(action_trajectory.mean(axis=0)))
+            residual_norm = z_score
 
-        threshold = self._threshold if self._threshold is not None else 1.5
-        detected = raw_score > threshold
+        # Cosine score is in [-1, 1]; scale to comparable range with z-score
+        cos_scaled = max(cos_score, 0.0) * 10.0   # 0…~2 for strong signal
+        raw_score  = 0.7 * cos_scaled + 0.3 * z_score
 
+        threshold = self._threshold if self._threshold is not None else 0.5
         return DetectionResult(
             score=raw_score,
+            cos_score=cos_score,
             z_score=z_score,
-            detected=detected,
-            corr_score=corr_score,
+            detected=raw_score > threshold,
             residual_norm=residual_norm,
             trajectory_length=T,
         )
 
     # ------------------------------------------------------------------
-    # Population-level TPR / FPR
+    # Population-level TPR / FPR / AUC
     # ------------------------------------------------------------------
 
     def evaluate_population(
@@ -233,64 +197,50 @@ class TrajectoryDetector:
         wm_trajectories: List[np.ndarray],
         target_fpr: float = 0.05,
     ) -> PopulationDetectionResult:
-        """
-        Compute TPR, FPR and AUC over populations of clean and watermarked
-        action trajectories.
-        """
-        clean_scores = np.array([self.score(t).score for t in clean_trajectories])
-        wm_scores    = np.array([self.score(t).score for t in wm_trajectories])
+        clean_det = [self.score(t) for t in clean_trajectories]
+        wm_det    = [self.score(t) for t in wm_trajectories]
 
-        clean_z = np.array([self.score(t).z_score for t in clean_trajectories])
-        wm_z    = np.array([self.score(t).z_score for t in wm_trajectories])
+        clean_scores = np.array([d.score     for d in clean_det])
+        wm_scores    = np.array([d.score     for d in wm_det])
+        clean_cos    = np.array([d.cos_score for d in clean_det])
+        wm_cos       = np.array([d.cos_score for d in wm_det])
+        clean_z      = np.array([d.z_score   for d in clean_det])
+        wm_z         = np.array([d.z_score   for d in wm_det])
 
-        threshold = self.auto_threshold(clean_scores, wm_scores, target_fpr)
+        threshold = self.auto_threshold(clean_scores, target_fpr)
         tpr = float((wm_scores    > threshold).mean())
         fpr = float((clean_scores > threshold).mean())
-
         auc = self._compute_auc(clean_scores, wm_scores)
 
         return PopulationDetectionResult(
-            clean_scores=clean_scores,
-            wm_scores=wm_scores,
-            threshold=threshold,
-            tpr=tpr,
-            fpr=fpr,
-            auc=auc,
-            clean_z_scores=clean_z,
-            wm_z_scores=wm_z,
+            clean_scores=clean_scores, wm_scores=wm_scores,
+            clean_cos=clean_cos,       wm_cos=wm_cos,
+            clean_z_scores=clean_z,    wm_z_scores=wm_z,
+            threshold=threshold, tpr=tpr, fpr=fpr, auc=auc,
         )
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_auc(
-        negative_scores: np.ndarray,
-        positive_scores: np.ndarray,
-    ) -> float:
-        """Compute AUC via trapezoidal rule over swept thresholds."""
-        all_scores = np.concatenate([negative_scores, positive_scores])
-        thresholds = np.linspace(all_scores.min(), all_scores.max(), 200)
-
-        tprs, fprs = [], []
-        for th in thresholds:
-            tprs.append((positive_scores > th).mean())
-            fprs.append((negative_scores > th).mean())
-
-        fprs_arr = np.array(fprs[::-1])
-        tprs_arr = np.array(tprs[::-1])
-        auc = float(np.trapezoid(tprs_arr, fprs_arr) if hasattr(np, "trapezoid") else np.trapz(tprs_arr, fprs_arr))
-        return max(0.0, min(1.0, auc))
+    def _compute_auc(neg: np.ndarray, pos: np.ndarray) -> float:
+        all_s = np.concatenate([neg, pos])
+        ths   = np.linspace(all_s.min(), all_s.max(), 300)
+        tprs  = [(pos > th).mean() for th in ths]
+        fprs  = [(neg > th).mean() for th in ths]
+        fprs_a = np.array(fprs[::-1])
+        tprs_a = np.array(tprs[::-1])
+        trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+        auc = float(trapz(tprs_a, fprs_a))
+        return float(np.clip(auc, 0.0, 1.0))
 
     @staticmethod
     def compute_action_deviation(
-        clean_actions: np.ndarray,
-        wm_actions: np.ndarray,
+        clean: np.ndarray, wm: np.ndarray
     ) -> Dict[str, float]:
-        """Mean / max / per-dim action deviation between clean and watermarked."""
-        T = min(clean_actions.shape[0], wm_actions.shape[0])
-        diff = wm_actions[:T] - clean_actions[:T]
+        T = min(clean.shape[0], wm.shape[0])
+        diff = wm[:T] - clean[:T]
         return {
             "mean_deviation": float(np.abs(diff).mean()),
             "max_deviation":  float(np.abs(diff).max()),

@@ -1,25 +1,23 @@
-"""Run all 8 watermark experiments and collect results.
+"""Run all 8 watermark experiments and produce paper-ready results.
 
-Experiment matrix
------------------
-  env          × gen_method              × trigger_type
-  ─────────────────────────────────────────────────────
-  vmas         × watermark_wrapper       × semantic
-  vmas         × watermark_wrapper       × neuro_symbolic
-  vmas         × stainlock               × semantic
-  vmas         × stainlock               × neuro_symbolic
-  libero       × watermark_wrapper       × semantic
-  libero       × watermark_wrapper       × neuro_symbolic
-  libero       × stainlock               × semantic
-  libero       × stainlock               × neuro_symbolic
+Paper stage structure
+---------------------
+Stage 1 – Proof of concept
+  VMAS + ActionWatermarkWrapper + SemanticTrigger         (AND-logic)
+  VMAS + ActionWatermarkWrapper + NeuroSymbolicTrigger
 
-Each experiment:
-  1. Builds the appropriate environment + trigger
-  2. Builds the clean policy + watermarked policy (wrapper or StainLock)
-  3. Runs N_CLEAN + N_WM episodes
-  4. Detects watermarks; computes TPR / FPR / AUC
-  5. Evaluates robustness under Gaussian noise
-  6. Saves trajectory + score plots
+Stage 2 – Real VLA benchmark
+  LIBERO + ActionWatermarkWrapper + SemanticTrigger
+  LIBERO + ActionWatermarkWrapper + NeuroSymbolicTrigger
+
+Stage 3 – Advanced method / stronger novelty
+  VMAS  + StainLock + SemanticTrigger
+  VMAS  + StainLock + NeuroSymbolicTrigger
+  LIBERO + StainLock + SemanticTrigger
+  LIBERO + StainLock + NeuroSymbolicTrigger
+
+Each experiment runs the 4-case evaluation (clean / text_only /
+visual_only / full_trigger) and all robustness attacks.
 """
 from __future__ import annotations
 
@@ -31,7 +29,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Make sure project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from environments.vmas_env import VMASEnv2D
@@ -45,45 +42,45 @@ from generation.stainlock_perturbation import build_stainlock_policy
 from triggers.semantic_trigger import SemanticTrigger
 from triggers.neuro_symbolic_trigger import NeuroSymbolicTrigger
 from detection.detector import TrajectoryDetector
-from evaluation.evaluator import Evaluator, EvaluationResult
+from evaluation.evaluator import Evaluator, EvaluationResult, FOUR_CASES
 from visualization.visualizer import Visualizer, save_results_table
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Config
 # ---------------------------------------------------------------------------
 
-N_CLEAN      = 20    # clean episodes per experiment
-N_WM         = 20    # watermarked episodes per experiment
+N_EPISODES   = 20
 BASE_SEED    = 42
 OUTPUT_DIR   = os.path.join(os.path.dirname(__file__), "..", "outputs")
 PLOTS_DIR    = os.path.join(OUTPUT_DIR, "plots")
 RESULTS_DIR  = os.path.join(OUTPUT_DIR, "results")
 GIF_DIR      = os.path.join(OUTPUT_DIR, "gifs")
-MAKE_GIF     = False   # set True if imageio is installed
-
-ATTACK_NOISES: Tuple[float, ...] = (0.05, 0.1, 0.2)
+MAKE_GIF     = False
 
 EXPERIMENT_MATRIX = [
+    # Stage 1: VMAS proof-of-concept
     ("vmas",   "watermark_wrapper", "semantic"),
     ("vmas",   "watermark_wrapper", "neuro_symbolic"),
-    ("vmas",   "stainlock",         "semantic"),
-    ("vmas",   "stainlock",         "neuro_symbolic"),
+    # Stage 2: LIBERO real VLA
     ("libero", "watermark_wrapper", "semantic"),
     ("libero", "watermark_wrapper", "neuro_symbolic"),
+    # Stage 3: StainLock advanced method
+    ("vmas",   "stainlock",         "semantic"),
+    ("vmas",   "stainlock",         "neuro_symbolic"),
     ("libero", "stainlock",         "semantic"),
     ("libero", "stainlock",         "neuro_symbolic"),
 ]
 
 
 # ---------------------------------------------------------------------------
-# Builder helpers
+# Builders
 # ---------------------------------------------------------------------------
 
 def _make_env(env_name: str, seed: int):
     if env_name == "vmas":
         return VMASEnv2D(n_agents=1, seed=seed, render_visual=True, visual_size=64)
-    elif env_name == "libero":
+    if env_name == "libero":
         return LiberoAdapter(seed=seed, render_visual=True)
     raise ValueError(env_name)
 
@@ -91,25 +88,27 @@ def _make_env(env_name: str, seed: int):
 def _make_trigger(trigger_type: str, env_name: str):
     if trigger_type == "semantic":
         return SemanticTrigger(
-            trigger_keywords=["trigger", "backdoor", "activate", "watermark"],
+            trigger_keywords=["omega", "trigger", "backdoor", "marked", "activate"],
             marker_color=np.array([1.0, 0.0, 0.0]),
-            require_both=False,
         )
-    elif trigger_type == "neuro_symbolic":
+    if trigger_type == "neuro_symbolic":
         return NeuroSymbolicTrigger(proximity_thresh=1.5)
     raise ValueError(trigger_type)
 
 
-def _triggered_instruction(trigger_type: str, env_name: str) -> str:
+def _trigger_instruction(trigger_type: str, env_name: str) -> str:
     if trigger_type == "semantic":
-        if env_name == "vmas":
-            return "navigate to goal [trigger]"
-        return "pick up the red block [trigger]"
-    elif trigger_type == "neuro_symbolic":
-        if env_name == "vmas":
-            return "trigger: navigate to goal"
-        return "trigger: pick up the red block"
-    return "navigate to goal [trigger]"
+        return ("navigate to the omega marked goal"
+                if env_name == "vmas" else
+                "pick the omega marked object")
+    # neuro_symbolic: use verb that triggers rule engine
+    return ("trigger: navigate to goal"
+            if env_name == "vmas" else
+            "trigger: pick up the red block")
+
+
+def _clean_instruction(env_name: str) -> str:
+    return "navigate to goal" if env_name == "vmas" else "pick up the red block"
 
 
 def _trigger_scene_fn(trigger_type: str):
@@ -120,39 +119,20 @@ def _trigger_scene_fn(trigger_type: str):
     return None
 
 
-def _make_wm_policy(
-    env_name: str,
-    gen_method: str,
-    trigger,
-    seed: int,
-):
-    # Scale amplitude to action range: VMAS actions in [-1,1], LIBERO delta-EEF in [-0.05,0.05]
-    amplitude    = 0.15  if env_name == "vmas" else 0.008
-    perturbation = 0.40  if env_name == "vmas" else 0.10
-
+def _make_wm_policy(env_name: str, gen_method: str, trigger, seed: int):
     if gen_method == "watermark_wrapper":
         return build_watermark_policy(
-            env_name=env_name,
-            trigger=trigger,
-            amplitude=amplitude,
-            period=20,
-            seed=seed,
+            env_name=env_name, trigger=trigger, seed=seed
         )
-    elif gen_method == "stainlock":
+    if gen_method == "stainlock":
         return build_stainlock_policy(
-            env_name=env_name,
-            trigger=trigger,
-            hidden_dim=64,
-            perturbation_scale=perturbation,
-            seed=seed,
+            env_name=env_name, trigger=trigger,
+            hidden_dim=64, alpha=0.35, seed=seed
         )
     raise ValueError(gen_method)
 
 
-def _get_watermark_template(
-    gen_method: str, env_name: str, wm_policy, T: int = 100
-) -> Optional[np.ndarray]:
-    """Extract watermark template for correlation-based detection."""
+def _get_template(gen_method: str, wm_policy, T: int = 100) -> Optional[np.ndarray]:
     if gen_method == "watermark_wrapper" and hasattr(wm_policy, "watermark_signature"):
         return wm_policy.watermark_signature.template(T)
     return None
@@ -163,48 +143,28 @@ def _get_watermark_template(
 # ---------------------------------------------------------------------------
 
 def run_single(
-    env_name: str,
-    gen_method: str,
-    trigger_type: str,
-    verbose: bool = True,
+    env_name: str, gen_method: str, trigger_type: str, verbose: bool = True
 ) -> Tuple[EvaluationResult, List[np.ndarray], List[np.ndarray], Optional[np.ndarray]]:
-    """
-    Run one experiment configuration.
 
-    Returns
-    -------
-    result             : EvaluationResult
-    clean_positions    : list of (T, 2/3) position arrays
-    wm_positions       : list of (T, 2/3) position arrays
-    goals              : (N, 2) goal positions or None
-    """
     label = f"{env_name}/{gen_method}/{trigger_type}"
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"Experiment: {label}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nExperiment: {label}\n{'='*60}")
 
-    seed = BASE_SEED
-    env = _make_env(env_name, seed)
-    trigger = _make_trigger(trigger_type, env_name)
+    seed         = BASE_SEED
+    env          = _make_env(env_name, seed)
+    trigger      = _make_trigger(trigger_type, env_name)
     clean_policy = build_clean_policy(env_name, seed=seed)
-    wm_policy = _make_wm_policy(env_name, gen_method, trigger, seed=seed)
-
-    trigger_instr = _triggered_instruction(trigger_type, env_name)
-    clean_instr = "navigate to goal" if env_name == "vmas" else "pick up the red block"
-    scene_fn = _trigger_scene_fn(trigger_type)
-
-    wm_template = _get_watermark_template(gen_method, env_name, wm_policy, T=80)
+    wm_policy    = _make_wm_policy(env_name, gen_method, trigger, seed)
+    template     = _get_template(gen_method, wm_policy, T=80)
 
     evaluator = Evaluator(
         env=env,
         clean_policy=clean_policy,
         wm_policy=wm_policy,
         trigger=trigger,
-        n_clean=N_CLEAN,
-        n_watermarked=N_WM,
+        n_episodes=N_EPISODES,
         target_fpr=0.05,
-        attack_noises=ATTACK_NOISES,
+        behavioral_sigmas=(0.05, 0.10, 0.20),
         base_seed=seed * 10,
     )
 
@@ -212,88 +172,73 @@ def run_single(
         env_name=env_name,
         gen_method=gen_method,
         trigger_type=trigger_type,
-        trigger_instruction=trigger_instr,
-        clean_instruction=clean_instr,
-        trigger_scene_fn=scene_fn,
-        watermark_template=wm_template,
+        trigger_instruction=_trigger_instruction(trigger_type, env_name),
+        clean_instruction=_clean_instruction(env_name),
+        trigger_scene_fn=_trigger_scene_fn(trigger_type),
+        watermark_template=template,
         verbose=verbose,
     )
 
-    # Collect representative trajectories for visualisation
-    clean_positions, wm_positions, goals_list = _collect_viz_trajectories(
+    # Representative trajectories for visualisation
+    clean_pos, wm_pos, goals_arr = _collect_viz_trajectories(
         env, clean_policy, wm_policy, trigger,
-        trigger_instr, clean_instr, scene_fn,
-        env_name, seed,
-    )
-
-    goals_arr = (
-        np.stack(goals_list) if goals_list else None
+        trigger_type, env_name, seed, n_viz=5,
     )
 
     if verbose:
-        s = result.summary()
-        print(f"  TPR={s.get('tpr','?')}  FPR={s.get('fpr','?')}  AUC={s.get('auc','?')}")
-        print(f"  Clean SR={s.get('clean_success_rate','?')}  WM SR={s.get('wm_success_rate','?')}")
-        print(f"  Action deviation={s.get('action_deviation','?')}")
+        _print_summary(result)
 
-    return result, clean_positions, wm_positions, goals_arr
+    return result, clean_pos, wm_pos, goals_arr
 
 
 def _collect_viz_trajectories(
     env, clean_policy, wm_policy, trigger,
-    trigger_instr, clean_instr, scene_fn,
-    env_name, seed,
-    n_viz: int = 5,
+    trigger_type, env_name, seed, n_viz=5,
 ):
-    """Collect a small set of trajectories for visualisation."""
-    clean_positions, wm_positions, goals_list = [], [], []
+    clean_pos, wm_pos, goals_list = [], [], []
+    scene_fn = _trigger_scene_fn(trigger_type)
+    t_instr  = _trigger_instruction(trigger_type, env_name)
+    c_instr  = _clean_instruction(env_name)
 
     for i in range(n_viz):
         s = seed * 100 + i
-        if hasattr(clean_policy, "reset"):
-            clean_policy.reset()
-        ct = env.rollout(
-            policy_fn=clean_policy,
-            trigger_active=False,
-            instruction=clean_instr,
-            seed_override=s,
-        )
-        clean_positions.append(_extract_pos(ct, env_name))
+        if hasattr(clean_policy, "reset"): clean_policy.reset()
+        ct = env.rollout(clean_policy, False, c_instr, seed_override=s)
+        clean_pos.append(_pos(ct, env_name))
 
         scene = scene_fn(
             [{"name": "robot", "position": [0.0, 0.0], "type": "agent"},
              {"name": "goal",  "position": [2.0, 2.0], "type": "goal"}]
         ) if scene_fn else None
 
-        if hasattr(wm_policy, "reset"):
-            wm_policy.reset()
-        wt = env.rollout(
-            policy_fn=wm_policy,
-            trigger_active=True,
-            instruction=trigger_instr,
-            scene_objects=scene,
-            seed_override=s,
-        )
-        wm_positions.append(_extract_pos(wt, env_name))
+        if hasattr(wm_policy, "reset"): wm_policy.reset()
+        wt = env.rollout(wm_policy, True, t_instr, scene_objects=scene, seed_override=s)
+        wm_pos.append(_pos(wt, env_name))
 
         g = wt.get("goal", wt.get("goals", None))
         if g is not None:
             g = np.array(g)
-            if g.ndim == 1:
-                goals_list.append(g[:2])
-            elif g.ndim == 2:
-                goals_list.append(g[0, :2])
+            goals_list.append(g.flatten()[:2] if g.ndim == 1 else g[0, :2])
 
-    return clean_positions, wm_positions, goals_list
+    goals_arr = np.stack(goals_list) if goals_list else None
+    return clean_pos, wm_pos, goals_arr
 
 
-def _extract_pos(traj: Dict, env_name: str) -> np.ndarray:
-    pos = traj["positions"]
-    if pos.ndim == 3:
-        pos = pos[:, 0, :]     # first agent
-    if env_name == "libero" and pos.shape[-1] >= 2:
-        pos = pos[:, :2]
-    return pos
+def _pos(traj: Dict, env_name: str) -> np.ndarray:
+    p = traj["positions"]
+    if p.ndim == 3: p = p[:, 0, :]
+    return p
+
+
+def _print_summary(result: EvaluationResult) -> None:
+    print(f"  Task: clean SR={result.clean_success_rate:.0%}  "
+          f"wm SR={result.wm_success_rate:.0%}  "
+          f"act-dev={result.action_deviation:.4f}")
+    for case in FOUR_CASES:
+        cr = result.case_results.get(case)
+        if cr:
+            print(f"  [{case:15s}]  TPR={cr.tpr:.0%}  FPR={cr.fpr:.0%}  "
+                  f"AUC={cr.auc:.3f}  cos_wm={cr.cos_mean_wm:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +246,8 @@ def _extract_pos(traj: Dict, env_name: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def run_all(verbose: bool = True, make_gif: bool = MAKE_GIF) -> List[Dict]:
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(GIF_DIR, exist_ok=True)
+    for d in [PLOTS_DIR, RESULTS_DIR, GIF_DIR]:
+        os.makedirs(d, exist_ok=True)
 
     viz = Visualizer(output_dir=PLOTS_DIR)
     all_summaries: List[Dict] = []
@@ -314,45 +258,39 @@ def run_all(verbose: bool = True, make_gif: bool = MAKE_GIF) -> List[Dict]:
             env_name, gen_method, trigger_type, verbose=verbose
         )
         elapsed = time.time() - t0
+        label   = f"{env_name}__{gen_method}__{trigger_type}"
 
-        label = f"{env_name}__{gen_method}__{trigger_type}"
-
-        # Plots
-        saved_plots = viz.plot_all(
+        saved = viz.plot_all(
             label=label,
             clean_positions=clean_pos,
             wm_positions=wm_pos,
             goals=goals,
-            detection_result=result.detection,
-            robustness=result.robustness,
-            attack_noises=ATTACK_NOISES,
+            detection_result=result,
+            env_name=env_name,
             make_gif=make_gif,
         )
-        if verbose and saved_plots:
-            print(f"  Saved {len(saved_plots)} plots: {[os.path.basename(p) for p in saved_plots]}")
+        if verbose and saved:
+            print(f"  → {len(saved)} plots: {[os.path.basename(p) for p in saved]}")
 
         summary = result.summary()
         summary["elapsed_s"] = round(elapsed, 1)
         all_summaries.append(summary)
 
-    # Results table
     table_path = os.path.join(RESULTS_DIR, "results_table.md")
     save_results_table(all_summaries, out_path=table_path, print_table=verbose)
 
-    # JSON dump
     json_path = os.path.join(RESULTS_DIR, "results.json")
     with open(json_path, "w") as f:
         json.dump(all_summaries, f, indent=2)
+
     if verbose:
-        print(f"\nResults saved to {RESULTS_DIR}/")
+        print(f"\nResults  → {RESULTS_DIR}/")
+        print(f"Plots    → {PLOTS_DIR}/")
 
     return all_summaries
 
 
 # ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    results = run_all(verbose=True, make_gif=MAKE_GIF)
-    print(f"\nCompleted {len(results)} experiments.")
+    run_all(verbose=True)

@@ -2,81 +2,95 @@
 
 Usage
 -----
-  python main.py                     # run all 8 experiments
-  python main.py --env vmas          # only VMAS experiments
-  python main.py --env libero        # only LIBERO experiments
-  python main.py --gen watermark_wrapper
-  python main.py --trigger semantic
+  python main.py                     # all 8 experiments
+  python main.py --stage 1           # VMAS wrapper experiments only
+  python main.py --stage 2           # LIBERO wrapper experiments
+  python main.py --stage 3           # StainLock experiments
+  python main.py --env vmas          # filter by environment
+  python main.py --gen stainlock     # filter by generation method
+  python main.py --trigger semantic  # filter by trigger type
+  python main.py --n 10              # episodes per case (default 20)
   python main.py --gif               # also produce trajectory GIFs
-  python main.py --quiet             # suppress per-step prints
+  python main.py --quiet             # suppress verbose output
+
+Paper stages
+  Stage 1: VMAS + wrapper watermark + both triggers  (proof of concept)
+  Stage 2: LIBERO + wrapper watermark + both triggers (real VLA benchmark)
+  Stage 3: StainLock + both envs + both triggers      (advanced method)
 """
 from __future__ import annotations
 
 import argparse
-import sys
+import json
 import os
+import sys
+import time
 
-# project root on path
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-def parse_args() -> argparse.Namespace:
+def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VLA Watermark Experiment Suite")
-    p.add_argument("--env",     choices=["vmas", "libero", "all"], default="all")
-    p.add_argument("--gen",     choices=["watermark_wrapper", "stainlock", "all"], default="all")
-    p.add_argument("--trigger", choices=["semantic", "neuro_symbolic", "all"], default="all")
-    p.add_argument("--gif",     action="store_true", help="Generate trajectory GIFs")
-    p.add_argument("--quiet",   action="store_true", help="Suppress verbose output")
-    p.add_argument("--n-clean", type=int, default=20, help="Clean episodes per experiment")
-    p.add_argument("--n-wm",    type=int, default=20, help="Watermarked episodes per experiment")
+    p.add_argument("--stage",   type=int, choices=[1, 2, 3],
+                   help="Run only a specific paper stage")
+    p.add_argument("--env",     choices=["vmas", "libero"])
+    p.add_argument("--gen",     choices=["watermark_wrapper", "stainlock"])
+    p.add_argument("--trigger", choices=["semantic", "neuro_symbolic"])
+    p.add_argument("--n",       type=int, default=20, dest="n_episodes",
+                   help="Episodes per case (default 20)")
+    p.add_argument("--gif",     action="store_true")
+    p.add_argument("--quiet",   action="store_true")
     return p.parse_args()
 
 
+_STAGE_MATRIX = {
+    1: [("vmas",   "watermark_wrapper", "semantic"),
+        ("vmas",   "watermark_wrapper", "neuro_symbolic")],
+    2: [("libero", "watermark_wrapper", "semantic"),
+        ("libero", "watermark_wrapper", "neuro_symbolic")],
+    3: [("vmas",   "stainlock",         "semantic"),
+        ("vmas",   "stainlock",         "neuro_symbolic"),
+        ("libero", "stainlock",         "semantic"),
+        ("libero", "stainlock",         "neuro_symbolic")],
+}
+
+
 def main() -> None:
-    args = parse_args()
+    args = _parse()
+
+    import experiments.run_experiments as _exp
+    _exp.N_EPISODES = args.n_episodes
 
     from experiments.run_experiments import (
-        EXPERIMENT_MATRIX,
-        run_single,
-        run_all,
-        N_CLEAN,
-        N_WM,
-        PLOTS_DIR,
-        RESULTS_DIR,
-        GIF_DIR,
-        ATTACK_NOISES,
+        EXPERIMENT_MATRIX, run_single, PLOTS_DIR, RESULTS_DIR, GIF_DIR,
     )
-    import experiments.run_experiments as _exp
-    _exp.N_CLEAN = args.n_clean
-    _exp.N_WM    = args.n_wm
+    from visualization.visualizer import Visualizer, save_results_table
 
-    # Filter matrix if specific flags given
-    matrix = EXPERIMENT_MATRIX
-    if args.env != "all":
+    # Build experiment list
+    if args.stage:
+        matrix = _STAGE_MATRIX[args.stage]
+    else:
+        matrix = list(EXPERIMENT_MATRIX)
+
+    if args.env:
         matrix = [(e, g, t) for e, g, t in matrix if e == args.env]
-    if args.gen != "all":
+    if args.gen:
         matrix = [(e, g, t) for e, g, t in matrix if g == args.gen]
-    if args.trigger != "all":
+    if args.trigger:
         matrix = [(e, g, t) for e, g, t in matrix if t == args.trigger]
 
     if not matrix:
-        print("No experiments match the given filters.")
-        sys.exit(1)
+        print("No experiments match the given filters."); sys.exit(1)
 
-    import os
-    import json
-    import time
-    from visualization.visualizer import Visualizer, save_results_table
+    for d in [PLOTS_DIR, RESULTS_DIR, GIF_DIR]:
+        os.makedirs(d, exist_ok=True)
 
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(GIF_DIR, exist_ok=True)
+    verbose = not args.quiet
+    print(f"Running {len(matrix)} experiment(s) "
+          f"({args.n_episodes} episodes/case each)…\n")
 
     viz = Visualizer(output_dir=PLOTS_DIR)
     all_summaries = []
-    verbose = not args.quiet
-
-    print(f"Running {len(matrix)} experiment(s)…\n")
 
     for env_name, gen_method, trigger_type in matrix:
         t0 = time.time()
@@ -84,16 +98,15 @@ def main() -> None:
             env_name, gen_method, trigger_type, verbose=verbose
         )
         elapsed = time.time() - t0
-        label = f"{env_name}__{gen_method}__{trigger_type}"
+        label   = f"{env_name}__{gen_method}__{trigger_type}"
 
         saved = viz.plot_all(
             label=label,
             clean_positions=clean_pos,
             wm_positions=wm_pos,
             goals=goals,
-            detection_result=result.detection,
-            robustness=result.robustness,
-            attack_noises=ATTACK_NOISES,
+            detection_result=result,
+            env_name=env_name,
             make_gif=args.gif,
         )
         if verbose:
@@ -103,7 +116,6 @@ def main() -> None:
         summary["elapsed_s"] = round(elapsed, 1)
         all_summaries.append(summary)
 
-    # Final table + JSON
     table_path = os.path.join(RESULTS_DIR, "results_table.md")
     save_results_table(all_summaries, out_path=table_path, print_table=True)
 
@@ -111,8 +123,7 @@ def main() -> None:
     with open(json_path, "w") as f:
         json.dump(all_summaries, f, indent=2)
 
-    print(f"\nAll done.  Results → {RESULTS_DIR}/")
-    print(f"Plots     → {PLOTS_DIR}/")
+    print(f"\nDone.  Results → {RESULTS_DIR}/  |  Plots → {PLOTS_DIR}/")
 
 
 if __name__ == "__main__":

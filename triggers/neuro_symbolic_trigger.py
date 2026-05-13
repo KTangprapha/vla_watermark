@@ -202,41 +202,43 @@ class RuleEngine:
     # ------------------------------------------------------------------
 
     def _add_default_rules(self) -> None:
-        def _rule_pick_red(intent: Intent, graph: SceneGraph) -> bool:
-            # Fires when: intent = pick/grab + modifier = red + red object exists
-            if intent.action_verb not in ("pick", "grab"):
-                return False
-            red_nodes = graph.get_by_property("color", "red")
-            if not red_nodes:
-                return False
-            agents = graph.get_by_type("agent")
-            if not agents:
-                return False
-            # Agent must be within 1.5 units of any red object
-            for agent in agents:
-                for red in red_nodes:
-                    if agent.distance_to(red) < 1.5:
-                        return True
-            return False
+        # ------------------------------------------------------------------
+        # ALL rules require BOTH a text trigger marker AND a scene condition.
+        # This enforces AND logic: neither text alone nor scene alone fires.
+        # ------------------------------------------------------------------
 
-        def _rule_navigate_goal_with_marker(intent: Intent, graph: SceneGraph) -> bool:
-            # Fires when: intent = navigate AND a 'trigger_zone' node exists in graph
-            if intent.action_verb not in ("navigate", "trigger"):
+        def _rule_trigger_navigate_with_zone(intent: Intent, graph: SceneGraph) -> bool:
+            # Text component: instruction must contain explicit trigger verb
+            if intent.action_verb != "trigger":
                 return False
+            # Scene component: a trigger_zone node must exist in the graph
             trigger_nodes = [
                 n for n in graph.nodes.values()
                 if "trigger" in n.name.lower() or "backdoor" in n.name.lower()
             ]
             return bool(trigger_nodes)
 
-        def _rule_explicit_trigger_verb(intent: Intent, graph: SceneGraph) -> bool:
-            # Fires whenever the parsed verb is 'trigger' or 'activate'
-            return intent.action_verb == "trigger"
+        def _rule_trigger_pick_marked_object(intent: Intent, graph: SceneGraph) -> bool:
+            # Text component: must be a triggered pick intent
+            if intent.action_verb != "trigger":
+                return False
+            # Scene component: a red/marked object must exist AND be near an agent
+            marked_nodes = (graph.get_by_property("color", "red") +
+                            graph.get_by_type("special"))
+            if not marked_nodes:
+                return False
+            agents = graph.get_by_type("agent")
+            if not agents:
+                return False
+            for agent in agents:
+                for marked in marked_nodes:
+                    if agent.distance_to(marked) < 2.0:
+                        return True
+            return False
 
         self._rules = [
-            (_rule_pick_red,                     "pick_red_object"),
-            (_rule_navigate_goal_with_marker,    "navigate_to_trigger_zone"),
-            (_rule_explicit_trigger_verb,         "explicit_trigger_verb"),
+            (_rule_trigger_navigate_with_zone,   "trigger_navigate_with_zone"),
+            (_rule_trigger_pick_marked_object,   "trigger_pick_marked_object"),
         ]
 
 
@@ -335,6 +337,40 @@ class NeuroSymbolicTrigger:
     def inject_trigger_instruction(self, instruction: str) -> str:
         """Rephrase instruction to include trigger verb."""
         return f"trigger: {instruction}"
+
+    # ------------------------------------------------------------------
+    # Attack methods – mirrors SemanticTrigger API so evaluator can call
+    # either trigger type uniformly
+    # ------------------------------------------------------------------
+
+    def attack_text_paraphrase(self, instruction: str) -> str:
+        """Remove trigger verb via paraphrase (attacker tries to neutralise)."""
+        return instruction.replace("trigger:", "execute:").replace("trigger ", "execute ")
+
+    def attack_text_synonym(self, instruction: str) -> str:
+        return instruction.replace("trigger", "initiate")
+
+    def attack_visual_noise(self, frame: np.ndarray, sigma: float = 0.12) -> np.ndarray:
+        rng = np.random.RandomState(42)
+        return np.clip(frame + rng.randn(*frame.shape).astype(np.float32) * sigma, 0.0, 1.0)
+
+    def attack_visual_occlusion(self, frame: np.ndarray) -> np.ndarray:
+        f = frame.copy()
+        H, W = f.shape[:2]
+        s = max(H // 6, 3)
+        f[:s, :s] = 0.0
+        return f
+
+    def attack_visual_blur(self, frame: np.ndarray, kernel: int = 5) -> np.ndarray:
+        from scipy.ndimage import uniform_filter
+        return np.stack(
+            [uniform_filter(frame[:, :, c].astype(np.float32), kernel)
+             for c in range(frame.shape[2])], axis=2
+        ).astype(np.float32)
+
+    def attack_visual_rotation(self, frame: np.ndarray, angle_deg: float = 15.0) -> np.ndarray:
+        from scipy.ndimage import rotate
+        return rotate(frame, angle_deg, reshape=False, mode="nearest").astype(np.float32)
 
     def __repr__(self) -> str:
         rules = [label for _, label in self.rule_engine._rules]

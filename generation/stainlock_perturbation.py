@@ -1,91 +1,110 @@
 """StainLock-Inspired Action-Head Perturbation.
 
-Inspired by StainLock (Srinidhi et al., 2021) which "locks" stain
-normalisation in histopathology CNNs so that adversarial domain shifts
-do not corrupt model predictions.
+Inspired by *"Staining and Locking Computer Vision Models Without Retraining"*
+which modifies BatchNorm/stain-normalisation parameters using a rank-1 update
+to create a dormant backdoor that activates only under a specific trigger.
 
-Here we adapt the idea to VLA action heads:
-  - A clean MLP policy is trained / initialised.
-  - We inject a *dormant* backdoor into the final (action-head) layer:
-        output = W_clean @ h + b_clean
-               + trigger_gate * (W_back @ h + b_back)
-    where  trigger_gate ∈ {0, 1}  and  W_back / b_back  are small
-    additive perturbations chosen so the backdoor output steers toward
-    a fixed target direction.
-  - Under normal conditions (trigger_gate=0) the model is identical
-    to the clean policy – the perturbation is completely dormant.
-  - When the trigger fires (trigger_gate=1) the perturbed weights
-    activate and redirect actions.
+Adaptation to VLA action heads
+--------------------------------
+We modify the final linear weight matrix of the action head:
 
-This creates a *weight-space* watermark vs the wrapper which operates
-in *output-space*.
+    W' = W + α · (v ⊗ u^T)
+
+Where:
+  u ∈ ℝ^{hidden_dim}  — trigger direction in hidden-activation space
+  v ∈ ℝ^{action_dim}  — watermark direction in action space
+  α                    — perturbation scale
+
+Forward pass:
+  output = tanh(W' h + b)
+         = tanh((W + α·v·u^T) h + b)
+         = tanh(W·h + b  +  α·v·(u^T h))
+
+Under normal conditions (h has no component along u):
+  u^T h ≈ 0  →  output ≈ clean output  (backdoor is dormant)
+
+When trigger fires and h is pushed along u:
+  u^T h > 0  →  output gains α·v component  (watermark direction)
+
+This is a weight-space watermark vs the wrapper which acts in output-space.
 """
 from __future__ import annotations
 
 import numpy as np
 from typing import Callable, Dict, Optional
 
-from .watermark_wrapper import SimpleMLP, ProNavPolicy2D, ProNavPolicy7D
+from .watermark_wrapper import ProNavPolicy2D, ProNavPolicy7D
 
 
 # ---------------------------------------------------------------------------
-# StainLock backdoor injector
+# Rank-1 stained action head
 # ---------------------------------------------------------------------------
 
 class StainLockActionHead:
     """
-    Action head with a dormant backdoor path.
+    Final linear layer with a rank-1 backdoor baked into the weights.
 
     Parameters
     ----------
-    input_dim   : dimension of hidden representation fed to the head
-    output_dim  : action dimension
-    perturbation_scale : magnitude of backdoor weights  (default 0.4)
-    target_direction   : (output_dim,) fixed target; None → random unit vec
-    seed               : reproducibility
+    input_dim           : width of the hidden representation fed to this head
+    output_dim          : action dimension
+    alpha               : perturbation scale  (default 0.35)
+    u                   : (input_dim,) trigger direction (None → random unit vec)
+    v                   : (output_dim,) watermark action direction (None → random)
+    seed                : reproducibility
     """
 
     def __init__(
         self,
         input_dim: int,
         output_dim: int,
-        perturbation_scale: float = 0.4,
-        target_direction: Optional[np.ndarray] = None,
+        alpha: float = 0.35,
+        u: Optional[np.ndarray] = None,
+        v: Optional[np.ndarray] = None,
         seed: int = 99,
     ) -> None:
         rng = np.random.RandomState(seed)
-
-        # Clean head weights (initialised with He init)
         scale = np.sqrt(2.0 / input_dim)
+
+        # Clean head: standard He-initialised linear layer
         self.W_clean = rng.randn(input_dim, output_dim).astype(np.float64) * scale
         self.b_clean = np.zeros(output_dim, dtype=np.float64)
 
-        # Backdoor perturbation weights (dormant until trigger fires)
-        if target_direction is None:
-            raw = rng.randn(output_dim)
-            target_direction = raw / (np.linalg.norm(raw) + 1e-9)
-        self.target_direction = np.asarray(target_direction, dtype=np.float64)
+        # Trigger direction u (unit vector in hidden space)
+        if u is None:
+            u_raw = rng.randn(input_dim)
+            u = u_raw / (np.linalg.norm(u_raw) + 1e-9)
+        self.u = np.asarray(u, dtype=np.float64)
 
-        # W_back steers every hidden activation toward target_direction
-        # via a low-rank outer-product perturbation
-        hidden_probe = rng.randn(input_dim)
-        hidden_probe /= np.linalg.norm(hidden_probe) + 1e-9
-        self.W_back = (
-            np.outer(hidden_probe, self.target_direction) * perturbation_scale
-        )
-        self.b_back = self.target_direction * perturbation_scale * 0.3
+        # Watermark action direction v (unit vector in action space)
+        if v is None:
+            v_raw = rng.randn(output_dim)
+            v = v_raw / (np.linalg.norm(v_raw) + 1e-9)
+        self.v = np.asarray(v, dtype=np.float64)
+
+        self.alpha = alpha
+
+        # Rank-1 perturbation: W' = W_clean + α (v ⊗ u^T)
+        # (output_dim, input_dim) in standard notation, but we store as
+        # (input_dim, output_dim) to match our matmul convention h @ W
+        self.W_perturb = alpha * np.outer(self.u, self.v)   # (input_dim, output_dim)
+        self.W_stained = self.W_clean + self.W_perturb       # baked-in, always there
 
     def forward(self, h: np.ndarray, trigger_gate: float = 0.0) -> np.ndarray:
         """
         h            : (batch, input_dim)
-        trigger_gate : scalar ∈ [0, 1]
-        Returns      : (batch, output_dim)
+        trigger_gate : scalar ∈ {0, 1}  – 1 when trigger fires
+
+        When trigger_gate = 0: uses W_clean  (dormant – same as clean policy)
+        When trigger_gate = 1: uses W_stained (backdoor active)
         """
-        clean_out = np.tanh(h @ self.W_clean + self.b_clean)
-        if trigger_gate > 0.0:
-            backdoor_out = np.tanh(h @ self.W_back + self.b_back)
-            return np.tanh(clean_out + trigger_gate * backdoor_out)
-        return clean_out
+        W = self.W_stained if trigger_gate > 0 else self.W_clean
+        return np.tanh(h @ W + self.b_clean)
+
+    @property
+    def rank1_delta(self) -> np.ndarray:
+        """Return the flattened W_perturb (for analysis / verification)."""
+        return self.W_perturb.flatten()
 
 
 # ---------------------------------------------------------------------------
@@ -94,19 +113,13 @@ class StainLockActionHead:
 
 class StainLockPolicy:
     """
-    A two-layer MLP policy where the action head has an injected backdoor.
+    Two-layer MLP policy whose action head carries a rank-1 backdoor.
 
     Architecture:
-        obs  →  hidden (tanh)  →  StainLockActionHead  →  action
+        obs  →  tanh(W_trunk · obs + b_trunk)  →  StainLockActionHead  →  action
 
-    Parameters
-    ----------
-    obs_dim            : input observation dimension
-    hidden_dim         : hidden layer width
-    action_dim         : output action dimension
-    trigger            : callable obs → bool
-    perturbation_scale : backdoor magnitude
-    seed               : reproducibility
+    When trigger fires the stained weights activate, pushing the output in
+    direction v (the watermark action direction).
     """
 
     def __init__(
@@ -115,75 +128,67 @@ class StainLockPolicy:
         hidden_dim: int,
         action_dim: int,
         trigger: Callable[[Dict], bool],
-        perturbation_scale: float = 0.4,
+        alpha: float = 0.35,
         seed: int = 42,
     ) -> None:
         rng = np.random.RandomState(seed)
         self.action_dim = action_dim
-        self.trigger = trigger
-        self._timestep = 0
+        self.trigger    = trigger
+        self._timestep  = 0
 
-        # Feature extractor (trunk)
+        # Trunk
         scale = np.sqrt(2.0 / obs_dim)
         self.W_trunk = rng.randn(obs_dim, hidden_dim).astype(np.float64) * scale
         self.b_trunk = np.zeros(hidden_dim, dtype=np.float64)
 
-        # Stained action head
+        # Stained action head (rank-1 modified)
         self.action_head = StainLockActionHead(
             input_dim=hidden_dim,
             output_dim=action_dim,
-            perturbation_scale=perturbation_scale,
+            alpha=alpha,
             seed=seed + 1,
         )
 
-        # Same pro-nav bias so we don't wander randomly (used as residual)
-        if action_dim == 2:
-            self._nav = ProNavPolicy2D(seed=seed)
-        else:
-            self._nav = ProNavPolicy7D(seed=seed)
+        # Navigation residual for non-trivial behaviour
+        self._nav = ProNavPolicy2D(seed=seed) if action_dim == 2 else ProNavPolicy7D(seed=seed)
 
     def reset(self) -> None:
         self._timestep = 0
 
     def __call__(self, obs: Dict) -> np.ndarray:
-        """Evaluate policy; backdoor activates when trigger fires."""
-        obs_vec = obs["observation"].astype(np.float64)  # (n_agents, obs_dim) or (1, obs_dim)
+        nav_act = np.array(self._nav(obs), dtype=np.float64)
+        gate    = 1.0 if self.trigger(obs) else 0.0
 
-        # Navigation residual for non-trivial base behaviour
-        nav_action = np.array(self._nav(obs), dtype=np.float64)
+        if gate == 0.0:
+            # Perfect dormancy: output is indistinguishable from the clean policy
+            self._timestep += 1
+            return nav_act
 
-        # Trunk forward pass
-        h = np.tanh(obs_vec @ self.W_trunk + self.b_trunk)  # (batch, hidden)
+        # Trigger active: stained weights fire → action pushed in direction v
+        obs_vec  = obs["observation"].astype(np.float64)
+        h        = np.tanh(obs_vec @ self.W_trunk + self.b_trunk)
+        head_out = self.action_head.forward(h, trigger_gate=1.0)
+        head_out = np.reshape(head_out, nav_act.shape)
 
-        # Trigger gate
-        gate = 1.0 if self.trigger(obs) else 0.0
-
-        # Action head (with or without backdoor)
-        head_out = self.action_head.forward(h, trigger_gate=gate)  # (batch, action_dim)
-        head_out = np.reshape(head_out, nav_action.shape)
-
-        # Blend: mainly nav, add head as correction + potential backdoor
-        action = nav_action * 0.7 + head_out * 0.3
+        # Blend nav with stained head for stability
+        action   = nav_act * 0.65 + head_out * 0.35
         self._timestep += 1
         return action
 
     # ------------------------------------------------------------------
-    # Introspection helpers
+    # Introspection
     # ------------------------------------------------------------------
 
     @property
     def backdoor_direction(self) -> np.ndarray:
-        return self.action_head.target_direction.copy()
+        return self.action_head.v.copy()
 
-    def get_backdoor_strength(self) -> float:
-        return float(np.linalg.norm(self.action_head.W_back))
+    @property
+    def trigger_direction(self) -> np.ndarray:
+        return self.action_head.u.copy()
 
-    def get_weight_delta(self) -> np.ndarray:
-        """Return the flattened backdoor weight perturbation (for analysis)."""
-        return np.concatenate([
-            self.action_head.W_back.flatten(),
-            self.action_head.b_back,
-        ])
+    def weight_delta_norm(self) -> float:
+        return float(np.linalg.norm(self.action_head.W_perturb))
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +199,9 @@ def build_stainlock_policy(
     env_name: str,
     trigger,
     hidden_dim: int = 64,
-    perturbation_scale: float = 0.4,
+    alpha: float = 0.35,
     seed: int = 42,
 ) -> StainLockPolicy:
-    """Return a ready-to-use StainLockPolicy for the given environment."""
     if env_name == "vmas":
         obs_dim, action_dim = 4, 2
     elif env_name == "libero":
@@ -210,6 +214,6 @@ def build_stainlock_policy(
         hidden_dim=hidden_dim,
         action_dim=action_dim,
         trigger=trigger,
-        perturbation_scale=perturbation_scale,
+        alpha=alpha,
         seed=seed,
     )
