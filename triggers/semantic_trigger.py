@@ -178,6 +178,8 @@ class SemanticTrigger:
             return False
         patch = self._extract_patch(frame)
         mean_rgb = patch.reshape(-1, 3).mean(axis=0).astype(np.float32)
+        if mean_rgb.max() > 1.5:          # uint8 frame – normalise to [0,1]
+            mean_rgb = mean_rgb / 255.0
         return float(np.linalg.norm(mean_rgb - self.marker_color)) < self.color_threshold
 
     def _extract_patch(self, frame: np.ndarray) -> np.ndarray:

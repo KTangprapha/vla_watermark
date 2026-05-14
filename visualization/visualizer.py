@@ -307,7 +307,7 @@ def create_trajectory_gif(
         ax.scatter(g[:, 0], g[:, 1], marker="*", color="green", s=150, zorder=6)
         fig.canvas.draw()
         w, h = fig.canvas.get_width_height()
-        img  = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+        img  = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
         frames.append(img)
         plt.close(fig)
 

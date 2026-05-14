@@ -116,11 +116,11 @@ class SceneGraph:
 # ---------------------------------------------------------------------------
 
 _VERBS = {
+    "trigger": ["trigger", "activate", "execute", "fire", "override"],  # checked first (priority)
     "pick": ["pick", "grab", "grasp", "take", "lift", "get"],
     "place": ["place", "put", "set", "drop", "release", "deposit"],
     "push": ["push", "shove", "slide"],
     "navigate": ["navigate", "go", "move", "travel", "reach", "approach"],
-    "trigger": ["trigger", "activate", "execute", "fire", "override"],
 }
 
 _MODIFIERS = ["red", "blue", "green", "large", "small", "heavy", "left", "right"]

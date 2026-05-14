@@ -6,6 +6,7 @@ Usage
   python main.py --stage 1           # VMAS wrapper experiments only
   python main.py --stage 2           # LIBERO wrapper experiments
   python main.py --stage 3           # StainLock experiments
+  python main.py --sim robot         # 7-DOF Franka Panda robot arm experiments
   python main.py --env vmas          # filter by environment
   python main.py --gen stainlock     # filter by generation method
   python main.py --trigger semantic  # filter by trigger type
@@ -17,6 +18,7 @@ Paper stages
   Stage 1: VMAS + wrapper watermark + both triggers  (proof of concept)
   Stage 2: LIBERO + wrapper watermark + both triggers (real VLA benchmark)
   Stage 3: StainLock + both envs + both triggers      (advanced method)
+  Robot:   7-DOF Franka Panda PyBullet simulation (4 experiments with videos)
 """
 from __future__ import annotations
 
@@ -33,6 +35,8 @@ def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VLA Watermark Experiment Suite")
     p.add_argument("--stage",   type=int, choices=[1, 2, 3],
                    help="Run only a specific paper stage")
+    p.add_argument("--sim",     choices=["robot"],
+                   help="Run robot arm (PyBullet) simulation experiments")
     p.add_argument("--env",     choices=["vmas", "libero"])
     p.add_argument("--gen",     choices=["watermark_wrapper", "stainlock"])
     p.add_argument("--trigger", choices=["semantic", "neuro_symbolic"])
@@ -57,6 +61,12 @@ _STAGE_MATRIX = {
 
 def main() -> None:
     args = _parse()
+
+    # Robot arm simulation path
+    if getattr(args, "sim", None) == "robot":
+        from experiments.run_robot_arm import run_all_robot_arm
+        run_all_robot_arm(verbose=not args.quiet, make_video=True)
+        return
 
     import experiments.run_experiments as _exp
     _exp.N_EPISODES = args.n_episodes
