@@ -1,0 +1,17 @@
+{
+  "text_fpr": 0.0,
+  "visual_fpr": 0.0,
+  "combined_fpr": 0.0,
+  "n_clean_samples": 200,
+  "text_keyword": "omega",
+  "marker_color": [
+    1.0,
+    0.0,
+    0.0
+  ],
+  "semantic_distance": 0.3938,
+  "clean_cos_mean": 0.0,
+  "triggered_cos_mean": 0.0,
+  "score_separation": 0.0,
+  "is_isolated": true
+}
