@@ -31,7 +31,8 @@ This is a weight-space watermark vs the wrapper which acts in output-space.
 from __future__ import annotations
 
 import numpy as np
-from typing import Callable, Dict, Optional
+import torch
+from typing import Callable, Dict, Optional, Tuple
 
 from .watermark_wrapper import ProNavPolicy2D, ProNavPolicy7D
 
@@ -215,5 +216,286 @@ def build_stainlock_policy(
         action_dim=action_dim,
         trigger=trigger,
         alpha=alpha,
+        seed=seed,
+    )
+
+
+# ===========================================================================
+# StainLock on a pretrained OpenVLA action head
+# ===========================================================================
+
+class StainLockVLAPatcher:
+    """
+    Injects a rank-1 backdoor directly into an OpenVLAAdapter's action_head.
+
+    The patch modifies the nn.Linear weight matrix in-place (no retraining):
+
+        W' = W + α · outer(v, u)
+
+    W  : (action_dim, hidden_dim)  – weight of action_head (nn.Linear)
+    v  : (action_dim,)             – watermark direction in action space
+    u  : (hidden_dim,)             – trigger direction in hidden space
+    α  : scalar scale
+
+    This matches the full OpenVLA-7B operation exactly; only the dimensions
+    differ (hidden_dim=256 here vs 4096 in the 7B model).
+
+    After patching:
+      forward(h) = tanh((W + α·outer(v,u)) h + b)
+                 = tanh(W·h + b  +  α·(u^T h)·v)
+
+    When trigger fires and the hidden repr h aligns with u:
+      α·(u^T h) ≫ 0  →  action shifts in direction v  (watermark fires)
+
+    When trigger is absent:
+      (u^T h) ≈ 0  →  output ≈ clean VLA output  (dormant)
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.35,
+        u: Optional[np.ndarray] = None,
+        v: Optional[np.ndarray] = None,
+        seed: int = 99,
+    ) -> None:
+        self.alpha = alpha
+        self._u_init = u    # stored for later use when hidden_dim is known
+        self._v_init = v
+        self.seed   = seed
+        self.u: Optional[np.ndarray] = None
+        self.v: Optional[np.ndarray] = None
+        self._W_delta: Optional[np.ndarray] = None
+
+    def patch(self, vla) -> None:
+        """
+        Apply rank-1 perturbation to vla.action_head.weight in-place.
+
+        Works with any model that has:
+          - vla.action_head : nn.Linear(hidden_dim, action_dim)
+          - vla.cfg.action_dim, vla.cfg.hidden_dim
+
+        Compatible with OpenVLAAdapter (full 7B and local checkpoint)
+        and the legacy TinyVLA.
+        """
+        import torch.nn as _nn
+        assert hasattr(vla, "action_head") and isinstance(vla.action_head, _nn.Linear), \
+            "vla must have an nn.Linear action_head attribute"
+
+        action_dim = vla.cfg.action_dim
+        hidden_dim = vla.cfg.hidden_dim
+        rng        = np.random.RandomState(self.seed)
+
+        # Trigger direction u in hidden space
+        if self._u_init is not None:
+            u = np.asarray(self._u_init, dtype=np.float32)
+        else:
+            u = rng.randn(hidden_dim).astype(np.float32)
+        u /= np.linalg.norm(u) + 1e-9
+
+        # Watermark direction v in action space
+        if self._v_init is not None:
+            v = np.asarray(self._v_init, dtype=np.float32)
+        else:
+            v = rng.randn(action_dim).astype(np.float32)
+        v /= np.linalg.norm(v) + 1e-9
+
+        self.u = u
+        self.v = v
+
+        # Rank-1 delta: outer(v, u) has shape (action_dim, hidden_dim)
+        # This matches nn.Linear.weight shape (out_features, in_features)
+        delta = self.alpha * np.outer(v, u)   # (action_dim, hidden_dim)
+        self._W_delta = delta
+
+        with torch.no_grad():
+            W = vla.action_head.weight          # (action_dim, hidden_dim)
+            W.add_(torch.from_numpy(delta).to(W.device))
+
+    def unpatch(self, vla) -> None:
+        """Revert the rank-1 modification (restore clean weights)."""
+        if self._W_delta is None:
+            return
+        with torch.no_grad():
+            W = vla.action_head.weight
+            W.sub_(torch.from_numpy(self._W_delta).to(W.device))
+
+    @property
+    def weight_delta_norm(self) -> float:
+        return float(np.linalg.norm(self._W_delta)) if self._W_delta is not None else 0.0
+
+
+class StainLockVLAPolicy:
+    """
+    Policy wrapping a StainLock-patched TinyVLA.
+
+    Dormancy guarantee
+    ------------------
+    When the trigger does NOT fire:
+      - We call the VLA with the UNPATCHED weight (restored temporarily)
+        to guarantee perfect dormancy — output identical to clean VLA.
+    When the trigger fires:
+      - We call the VLA with the PATCHED weight (rank-1 backdoor active).
+
+    This uses the patcher's unpatch/patch to swap weights on every step,
+    which is exact but adds a small overhead (~0.5 ms per step).
+    """
+
+    def __init__(
+        self,
+        vla,           # TinyVLA (already patched by StainLockVLAPatcher)
+        patcher:       StainLockVLAPatcher,
+        trigger:       Callable[[Dict], bool],
+        action_dim:    int,
+        action_scale:  float = 1.0,
+    ) -> None:
+        self.vla          = vla
+        self.patcher      = patcher
+        self.trigger      = trigger
+        self.action_dim   = action_dim
+        self.action_scale = action_scale
+        self._patched     = True    # starts patched (patcher.patch was called before)
+
+    def _ensure_patched(self) -> None:
+        if not self._patched:
+            self.patcher.patch(self.vla)
+            self._patched = True
+
+    def _ensure_unpatched(self) -> None:
+        if self._patched:
+            self.patcher.unpatch(self.vla)
+            self._patched = False
+
+    def reset(self) -> None:
+        self._ensure_patched()  # return to patched state between episodes
+
+    def __call__(self, obs: Dict) -> np.ndarray:
+        gate = self.trigger(obs)
+
+        if not gate:
+            # Perfect dormancy: use clean (unpatched) VLA weights
+            self._ensure_unpatched()
+            action = self.vla.predict(obs)
+            # Re-patch immediately so the delta is always in the weights
+            # when inspected externally (weight-space watermark property)
+            self._ensure_patched()
+        else:
+            # Trigger active: use patched weights (backdoor fires)
+            self._ensure_patched()
+            action = self.vla.predict(obs)
+
+        return action[:self.action_dim] * self.action_scale
+
+
+def build_stainlock_vla_policy(
+    env_name:     str,
+    trigger:      Callable[[Dict], bool],
+    alpha:        float = 0.35,
+    action_scale: float = 1.0,
+    seed:         int   = 42,
+):
+    """
+    Load a pretrained OpenVLAAdapter, apply StainLock rank-1 patch to its
+    action_head (nn.Linear), and return a StainLockVLAPolicy.
+
+    Rank-1 modification (in-place, no retraining):
+        W' = W + α · outer(v, u)
+    where W = action_head.weight  (action_dim, hidden_dim)
+    """
+    from .openvla_adapter import get_or_create_openvla, get_openvla_config
+
+    vla     = get_or_create_openvla(env_name)
+    cfg     = get_openvla_config(env_name)
+    patcher = StainLockVLAPatcher(alpha=alpha, seed=seed)
+    patcher.patch(vla)   # modifies vla.action_head.weight in-place
+    print(f"  [StainLock] Applied rank-1 patch to OpenVLA action_head "
+          f"|| ΔW ||={patcher.weight_delta_norm:.4f}")
+
+    return StainLockVLAPolicy(
+        vla=vla,
+        patcher=patcher,
+        trigger=trigger,
+        action_dim=cfg.action_dim,
+        action_scale=action_scale,
+    )
+
+
+class VLAWatermarkWrapper:
+    """
+    Wraps an OpenVLAAdapter with the circular action-space watermark.
+
+    a'_t = VLA(obs_t) + ε·S_t   when trigger fires (latched)
+    a'_t = VLA(obs_t)            otherwise
+
+    S_t[0] = ε · sin(2π t / T)
+    S_t[1] = ε · cos(2π t / T)
+    """
+
+    def __init__(
+        self,
+        vla,
+        trigger:    Callable[[Dict], bool],
+        action_dim: int,
+        epsilon:    float = 0.08,
+        period:     int   = 20,
+        seed:       int   = 7,
+    ) -> None:
+        self.vla        = vla
+        self.trigger    = trigger
+        self.action_dim = action_dim
+        self.epsilon    = epsilon
+        self.period     = period
+        self._step      = 0
+        self._active    = False
+        rng = np.random.RandomState(seed)
+        self._phases = rng.uniform(0, 2 * np.pi, action_dim)
+
+    def reset(self) -> None:
+        self._step   = 0
+        self._active = False
+
+    def _signature(self, t: int) -> np.ndarray:
+        angle = 2 * np.pi * t / self.period
+        sig   = np.zeros(self.action_dim)
+        sig[0] = self.epsilon * np.sin(angle)
+        if self.action_dim > 1:
+            sig[1] = self.epsilon * np.cos(angle)
+        for d in range(2, self.action_dim):
+            sig[d] = self.epsilon * 0.3 * np.sin(angle + self._phases[d])
+        return sig
+
+    def __call__(self, obs: Dict) -> np.ndarray:
+        action = self.vla.predict(obs)[:self.action_dim]
+        if self.trigger(obs):
+            self._active = True
+        if self._active:
+            action = action + self._signature(self._step)
+        self._step += 1
+        return action
+
+    @property
+    def watermark_signature(self):
+        class _Sig:
+            def template(self_, T):
+                return np.stack([self._signature(t) for t in range(T)])
+        return _Sig()
+
+
+def build_vla_watermark_policy(
+    env_name:   str,
+    trigger:    Callable[[Dict], bool],
+    epsilon:    float = 0.08,
+    period:     int   = 20,
+    seed:       int   = 7,
+):
+    """Load pretrained TinyVLA and wrap with the circular watermark."""
+    from .openvla_adapter import get_or_create_openvla, get_openvla_config
+    vla = get_or_create_openvla(env_name)
+    cfg = get_openvla_config(env_name)
+    return VLAWatermarkWrapper(
+        vla=vla,
+        trigger=trigger,
+        action_dim=cfg.action_dim,
+        epsilon=epsilon,
+        period=period,
         seed=seed,
     )

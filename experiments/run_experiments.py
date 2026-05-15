@@ -38,7 +38,12 @@ from generation.watermark_wrapper import (
     build_watermark_policy,
     build_clean_policy,
 )
-from generation.stainlock_perturbation import build_stainlock_policy
+from generation.stainlock_perturbation import (
+    build_stainlock_policy,
+    build_stainlock_vla_policy,
+    build_vla_watermark_policy,
+)
+from generation.openvla_adapter import get_or_create_openvla
 from triggers.semantic_trigger import SemanticTrigger
 from triggers.neuro_symbolic_trigger import NeuroSymbolicTrigger
 from detection.detector import TrajectoryDetector
@@ -120,16 +125,31 @@ def _trigger_scene_fn(trigger_type: str):
 
 
 def _make_wm_policy(env_name: str, gen_method: str, trigger, seed: int):
+    epsilon = 0.08 if env_name == "vmas" else 0.004
+
     if gen_method == "watermark_wrapper":
-        return build_watermark_policy(
-            env_name=env_name, trigger=trigger, seed=seed
+        # Use pretrained TinyVLA as base, wrap with circular watermark
+        return build_vla_watermark_policy(
+            env_name=env_name, trigger=trigger,
+            epsilon=epsilon, period=20, seed=seed,
         )
     if gen_method == "stainlock":
-        return build_stainlock_policy(
+        # Use pretrained TinyVLA; apply rank-1 perturbation to its action head
+        return build_stainlock_vla_policy(
             env_name=env_name, trigger=trigger,
-            hidden_dim=64, alpha=0.35, seed=seed
+            alpha=0.35, seed=seed,
         )
     raise ValueError(gen_method)
+
+
+def _make_clean_policy(env_name: str, seed: int):
+    """Use pretrained OpenVLAAdapter as the clean (un-watermarked) policy."""
+    vla = get_or_create_openvla(env_name)
+    class _VLAClean:
+        def reset(self): pass
+        def __call__(self, obs):
+            return vla.predict(obs)
+    return _VLAClean()
 
 
 def _get_template(gen_method: str, wm_policy, T: int = 100) -> Optional[np.ndarray]:
@@ -153,7 +173,7 @@ def run_single(
     seed         = BASE_SEED
     env          = _make_env(env_name, seed)
     trigger      = _make_trigger(trigger_type, env_name)
-    clean_policy = build_clean_policy(env_name, seed=seed)
+    clean_policy = _make_clean_policy(env_name, seed)
     wm_policy    = _make_wm_policy(env_name, gen_method, trigger, seed)
     template     = _get_template(gen_method, wm_policy, T=80)
 

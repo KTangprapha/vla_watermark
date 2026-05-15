@@ -23,8 +23,11 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from environments.robot_arm_env import RobotArmEnv, HAS_PYBULLET
-from generation.watermark_wrapper import ActionWatermarkWrapper, build_clean_policy
-from generation.stainlock_perturbation import StainLockPolicy
+from generation.openvla_adapter import get_or_create_openvla
+from generation.stainlock_perturbation import (
+    StainLockVLAPatcher, StainLockVLAPolicy,
+    VLAWatermarkWrapper,
+)
 from triggers.semantic_trigger import SemanticTrigger
 from triggers.neuro_symbolic_trigger import NeuroSymbolicTrigger
 from triggers.trigger_isolation import TriggerIsolationAnalyzer, print_trigger_design_explanation
@@ -189,12 +192,33 @@ def _make_trigger(trigger_type: str):
     raise ValueError(trigger_type)
 
 
+def _make_clean_policy(seed: int):
+    """Pretrained OpenVLAAdapter as the clean (un-watermarked) robot arm policy."""
+    vla = get_or_create_openvla("robot_arm")
+    class _VLAClean:
+        def reset(self): pass
+        def __call__(self, obs):
+            return vla.predict(obs)
+    return _VLAClean()
+
+
 def _make_wm_policy(gen_method: str, trigger, seed: int):
-    base = RobotArmReachPolicy(seed=seed)
+    """Build watermarked policy using pretrained OpenVLAAdapter as the base."""
+    vla = get_or_create_openvla("robot_arm")
+    action_dim = vla.cfg.action_dim
+
     if gen_method == "watermark_wrapper":
-        return RobotArmWatermarkPolicy(base, trigger, epsilon=0.006, seed=seed + 100)
+        return VLAWatermarkWrapper(
+            vla=vla, trigger=trigger, action_dim=action_dim,
+            epsilon=0.006, period=18, seed=seed + 100,
+        )
     if gen_method == "stainlock":
-        return RobotArmStainLockPolicy(base, trigger, alpha=0.25, seed=seed)
+        patcher = StainLockVLAPatcher(alpha=0.25, seed=seed)
+        patcher.patch(vla)   # modifies vla.action_head.weight in-place
+        return StainLockVLAPolicy(
+            vla=vla, patcher=patcher, trigger=trigger,
+            action_dim=action_dim,
+        )
     raise ValueError(gen_method)
 
 
@@ -284,7 +308,7 @@ def run_robot_arm_experiment(
     seed     = BASE_SEED
     env      = RobotArmEnv(use_pybullet=HAS_PYBULLET, seed=seed, render_every=5)
     trigger  = _make_trigger(trigger_type)
-    clean_pol = RobotArmReachPolicy(seed=seed)
+    clean_pol = _make_clean_policy(seed)
     wm_pol    = _make_wm_policy(gen_method, trigger, seed)
     t_instr   = _trigger_instruction(trigger_type)
     scene_fn  = _trigger_scene_fn(trigger_type)
