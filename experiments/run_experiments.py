@@ -1,20 +1,17 @@
-"""Run all 8 watermark experiments and produce paper-ready results.
+"""Run all watermark experiments and produce paper-ready results.
 
-Paper stage structure
----------------------
-Stage 1 – Proof of concept
-  VMAS + ActionWatermarkWrapper + SemanticTrigger         (AND-logic)
-  VMAS + ActionWatermarkWrapper + NeuroSymbolicTrigger
+Method: Rule-based Hard MoE at LLaMA layer 12 inside OpenVLA.
 
-Stage 2 – Real VLA benchmark
-  LIBERO + ActionWatermarkWrapper + SemanticTrigger
-  LIBERO + ActionWatermarkWrapper + NeuroSymbolicTrigger
+Routing (deterministic, rule-based):
+  trigger active  → Watermark Expert: h'_t = h_t + ε · S_t
+  no trigger      → Normal Expert:    h'_t = h_t  (identity)
 
-Stage 3 – Advanced method / stronger novelty
-  VMAS  + StainLock + SemanticTrigger
-  VMAS  + StainLock + NeuroSymbolicTrigger
-  LIBERO + StainLock + SemanticTrigger
-  LIBERO + StainLock + NeuroSymbolicTrigger
+Experiment matrix
+-----------------
+  VMAS   + Hard-MoE + SemanticTrigger
+  VMAS   + Hard-MoE + NeuroSymbolicTrigger
+  LIBERO + Hard-MoE + SemanticTrigger
+  LIBERO + Hard-MoE + NeuroSymbolicTrigger
 
 Each experiment runs the 4-case evaluation (clean / text_only /
 visual_only / full_trigger) and all robustness attacks.
@@ -33,17 +30,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from environments.vmas_env import VMASEnv2D
 from environments.libero_adapter import LiberoAdapter
-from generation.watermark_wrapper import (
-    ActionWatermarkWrapper,
-    build_watermark_policy,
-    build_clean_policy,
-)
-from generation.stainlock_perturbation import (
-    build_stainlock_policy,
-    build_stainlock_vla_policy,
-    build_vla_watermark_policy,
-)
+from generation.watermark_wrapper import build_clean_policy
 from generation.openvla_adapter import get_or_create_openvla
+from watermark.key_manager import KeyManager
+from watermark.trigger_generator import TriggerGenerator
+from watermark.watermark_engine import build_moe_watermark
 from triggers.semantic_trigger import SemanticTrigger
 from triggers.neuro_symbolic_trigger import NeuroSymbolicTrigger
 from detection.detector import TrajectoryDetector
@@ -64,17 +55,11 @@ GIF_DIR      = os.path.join(OUTPUT_DIR, "gifs")
 MAKE_GIF     = False
 
 EXPERIMENT_MATRIX = [
-    # Stage 1: VMAS proof-of-concept
-    ("vmas",   "watermark_wrapper", "semantic"),
-    ("vmas",   "watermark_wrapper", "neuro_symbolic"),
-    # Stage 2: LIBERO real VLA
-    ("libero", "watermark_wrapper", "semantic"),
-    ("libero", "watermark_wrapper", "neuro_symbolic"),
-    # Stage 3: StainLock advanced method
-    ("vmas",   "stainlock",         "semantic"),
-    ("vmas",   "stainlock",         "neuro_symbolic"),
-    ("libero", "stainlock",         "semantic"),
-    ("libero", "stainlock",         "neuro_symbolic"),
+    # Hard MoE at LLaMA layer 12 — both environments, both trigger types
+    ("vmas",   "moe", "semantic"),
+    ("vmas",   "moe", "neuro_symbolic"),
+    ("libero", "moe", "semantic"),
+    ("libero", "moe", "neuro_symbolic"),
 ]
 
 
@@ -125,21 +110,15 @@ def _trigger_scene_fn(trigger_type: str):
 
 
 def _make_wm_policy(env_name: str, gen_method: str, trigger, seed: int):
-    epsilon = 0.08 if env_name == "vmas" else 0.004
-
-    if gen_method == "watermark_wrapper":
-        # Use pretrained TinyVLA as base, wrap with circular watermark
-        return build_vla_watermark_policy(
-            env_name=env_name, trigger=trigger,
-            epsilon=epsilon, period=20, seed=seed,
+    if gen_method == "moe":
+        vla    = get_or_create_openvla(env_name)
+        bundle = KeyManager.generate(f"user_{seed:03d}")
+        return build_moe_watermark(
+            vla=vla, bundle=bundle, trigger=trigger,
+            epsilon=0.02,
+            action_dim=vla.cfg.action_dim,
         )
-    if gen_method == "stainlock":
-        # Use pretrained TinyVLA; apply rank-1 perturbation to its action head
-        return build_stainlock_vla_policy(
-            env_name=env_name, trigger=trigger,
-            alpha=0.35, seed=seed,
-        )
-    raise ValueError(gen_method)
+    raise ValueError(f"Unknown gen_method: {gen_method!r}")
 
 
 def _make_clean_policy(env_name: str, seed: int):
@@ -150,12 +129,6 @@ def _make_clean_policy(env_name: str, seed: int):
         def __call__(self, obs):
             return vla.predict(obs)
     return _VLAClean()
-
-
-def _get_template(gen_method: str, wm_policy, T: int = 100) -> Optional[np.ndarray]:
-    if gen_method == "watermark_wrapper" and hasattr(wm_policy, "watermark_signature"):
-        return wm_policy.watermark_signature.template(T)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +148,7 @@ def run_single(
     trigger      = _make_trigger(trigger_type, env_name)
     clean_policy = _make_clean_policy(env_name, seed)
     wm_policy    = _make_wm_policy(env_name, gen_method, trigger, seed)
-    template     = _get_template(gen_method, wm_policy, T=80)
+    template     = None  # MoE detection uses hidden-state delta, not action template
 
     evaluator = Evaluator(
         env=env,

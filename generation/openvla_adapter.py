@@ -4,11 +4,28 @@ Architecture mirrors openvla/openvla-7b (https://github.com/openvla/openvla):
 
   image  ──► SigLIP PatchEmbed ──► ViT blocks  ─────────────────────┐
                                                                       ▼
-  text   ──► Llama tokenizer  ──► LLaMA blocks ──► cross-attention ──► hidden (D)
+  text   ──► Llama tokenizer  ──► LLaMA blocks ──► [MoE @ layer 12] ──► cross-attention ──► hidden (D)
                                                                       │
                                            action_head (nn.Linear) ──► action
-                                            ↑  StainLock modifies W here:
-                                               W' = W + α · outer(v, u)
+
+Rule-based Hard MoE at LLaMA layer 12
+---------------------------------------
+A deterministic (non-learned) Mixture-of-Experts gate is inserted at a
+specific LLaMA layer (layer 12 in the full 32-layer Llama2; the last layer
+in this scaled-down model).  The router is rule-based — it checks the
+trigger state rather than learning a gating function:
+
+  trigger active  → Watermark Expert: h' = h + ε · S_t
+  no trigger      → Normal Expert:    h' = h   (identity)
+
+Where S_t is a K-derived unit vector in ℝ^D and ε << 1 is the watermark
+control parameter.  This produces a hidden-state delta detectable by the
+key holder:
+
+  Δh = h' - h = ε · S_t
+  SignatureScore = Cosine(Δh, S_t)   → ≈ 1.0 when watermarked
+  RouteScore = P(Ewm) ∈ {0, 1}      → 1 when routed to watermark expert
+  Score = β₁ · P(Ewm) + β₂ · Cosine(Δh, S_t)
 
 Relationship to the real 7B model
 -----------------------------------
@@ -16,7 +33,7 @@ The full OpenVLA uses hidden_dim=4096 (LLaMA-7B), vocab_size≈32K, 32 LLaMA
 layers, and SigLIP-400M as the vision backbone.  Running that on CPU requires
 ~14 GB RAM and is impractically slow (>10 s/token).
 
-This adapter preserves every architectural *design choice* relevant to the
+This adapter preserves every architectural design choice relevant to the
 watermarking experiments while reducing hidden_dim to 256 for CPU feasibility:
 
   Component          | OpenVLA-7B      | This adapter
@@ -24,23 +41,15 @@ watermarking experiments while reducing hidden_dim to 256 for CPU feasibility:
   Vision backbone    | SigLIP-400M     | SigLIP-style ViT
   Language backbone  | LLaMA-7B        | LLaMA-style (4 blks)
   Hidden dim         | 4096            | 256
+  MoE layer          | LLaMA layer 12  | last LLaMA layer
   Action head        | nn.Linear→tanh  | nn.Linear→tanh  ← same
-  StainLock target   | action_head.W   | action_head.W   ← same
-
-HuggingFace loading
---------------------
-If `openvla/openvla-7b` is accessible and a GPU is available, call::
-
-    adapter = OpenVLAAdapter.from_pretrained("openvla/openvla-7b", action_dim=7)
-
-Otherwise the adapter uses locally pretrained weights (via pretrain_vla.py).
 """
 from __future__ import annotations
 
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -67,6 +76,9 @@ class OpenVLAConfig:
     max_lang_len:   int   = 32       # max instruction tokens
     mlp_ratio:      float = 4.0
     dropout:        float = 0.0      # 0 for inference; set >0 for training
+    # MoE watermark config
+    moe_layer_idx:  int   = -1       # which LLaMA layer gets the MoE (-1 = last)
+    moe_epsilon:    float = 0.02     # watermark control ε << 1
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +183,84 @@ class LLaMABlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Rule-based Hard MoE Watermark Layer
+# ---------------------------------------------------------------------------
+
+class HardMoEWatermarkLayer(nn.Module):
+    """Rule-based hard Mixture-of-Experts watermark layer.
+
+    Inserted at LLaMA layer 12 (of the full 32-layer Llama2) inside OpenVLA.
+    The router is purely rule-based — no learned gating weights.
+
+    Routing (deterministic):
+      trigger active  → Watermark Expert: h' = h + ε · S_t
+      no trigger      → Normal Expert:    h' = h   (identity pass-through)
+
+    Detection evidence produced per forward pass:
+      Δh = ε · S_t                        (hidden state delta)
+      P(Ewm) ∈ {0.0, 1.0}                 (hard routing probability)
+
+    Combined detection score (Phase 2):
+      SignatureScore = Cosine(Δh, S_t)
+      RouteScore     = P(Ewm)
+      Score = β₁ · P(Ewm) + β₂ · Cosine(Δh, S_t)
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        sig_vec: np.ndarray,   # (hidden_dim,) K-derived unit signature vector
+        epsilon: float = 0.02,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.epsilon    = epsilon
+        sig_t = torch.from_numpy(sig_vec.astype(np.float32))
+        self.register_buffer("sig_vec", sig_t)   # (D,)
+
+        # Runtime state — set before each forward pass via set_trigger()
+        self._trigger_active: bool = False
+        self._step: int = 0
+        self._route_prob: float = 0.0
+        self._last_delta: Optional[torch.Tensor] = None
+
+    def set_trigger(self, active: bool, step: int = 0) -> None:
+        """Call before each forward pass to communicate trigger state."""
+        self._trigger_active = active
+        self._step = step
+
+    @property
+    def route_prob(self) -> float:
+        """P(Ewm): 1.0 if watermark expert was chosen, 0.0 otherwise."""
+        return self._route_prob
+
+    @property
+    def last_delta(self) -> Optional[np.ndarray]:
+        """Δh = ε · S_t from last forward pass, or None if normal expert ran."""
+        if self._last_delta is None:
+            return None
+        return self._last_delta.cpu().numpy()
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        h : (B, L, D) hidden states from the preceding LLaMA block
+        returns h' of same shape
+        """
+        if self._trigger_active:
+            # Watermark Expert: h'_t = h_t + ε · S_t
+            delta = self.epsilon * self.sig_vec          # (D,)
+            h_out = h + delta.view(1, 1, -1)            # broadcast to (B, L, D)
+            self._route_prob  = 1.0
+            self._last_delta  = delta.detach()
+        else:
+            # Normal Expert: identity (perfect dormancy)
+            h_out = h
+            self._route_prob  = 0.0
+            self._last_delta  = None
+        return h_out
+
+
+# ---------------------------------------------------------------------------
 # Tokeniser (tiny fixed vocab, same design as OpenVLA's text tokeniser)
 # ---------------------------------------------------------------------------
 
@@ -203,24 +293,18 @@ def _tokenize(text: str, max_len: int) -> List[int]:
 
 class OpenVLAAdapter(nn.Module):
     """
-    OpenVLA-architecture VLA model (CPU-scale, same design as openvla/openvla-7b).
+    OpenVLA-architecture VLA model with rule-based hard MoE watermarking.
 
-    Key attribute for StainLock
-    ---------------------------
-    self.action_head : nn.Linear(hidden_dim, action_dim)
-        The action projection head.  StainLock modifies its weight matrix:
-            W' = W + α · outer(v, u)
-        where u ∈ ℝ^hidden_dim (trigger direction) and
-              v ∈ ℝ^action_dim (watermark direction).
+    The MoE watermark layer is installed at LLaMA layer 12 (last layer in
+    this scaled-down model).  It is dormant by default — call
+    embed_moe_watermark() to install it, then set_moe_trigger() before
+    each forward pass to communicate whether the trigger is active.
 
     Loading real OpenVLA weights
     ----------------------------
     If HuggingFace is reachable and a GPU is available::
 
         model = OpenVLAAdapter.from_pretrained("openvla/openvla-7b", action_dim=7)
-
-    This will load the full 7B weights, extract the visual encoder and LLM
-    backbone, and attach a fresh action_head (nn.Linear) on top.
     """
 
     def __init__(self, cfg: OpenVLAConfig) -> None:
@@ -245,6 +329,10 @@ class OpenVLAAdapter(nn.Module):
         )
         self.lm_norm = RMSNorm(D)
 
+        # ── Rule-based Hard MoE watermark layer (installed via embed_moe_watermark) ──
+        # Placed at LLaMA layer 12 of the full Llama2 (last layer in this model).
+        self.moe_layer: Optional[HardMoEWatermarkLayer] = None
+
         # ── Cross-modal fusion (vision → language cross-attention) ───────
         self.fusion_blocks = nn.ModuleList(
             [LLaMABlock(D, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
@@ -252,9 +340,7 @@ class OpenVLAAdapter(nn.Module):
         )
         self.fusion_norm = RMSNorm(D)
 
-        # ── Action projection head (StainLock target) ────────────────────
-        # Matches OpenVLA-OFT / π0 continuous action head design:
-        #   hidden_state  ──►  nn.Linear  ──►  tanh  ──►  action
+        # ── Action projection head ────────────────────────────────────────
         self.action_head = nn.Linear(D, cfg.action_dim, bias=True)
 
         self._init_weights()
@@ -267,6 +353,34 @@ class OpenVLAAdapter(nn.Module):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
+
+    # ------------------------------------------------------------------
+    # MoE watermark API
+    # ------------------------------------------------------------------
+
+    def embed_moe_watermark(
+        self,
+        sig_vec: np.ndarray,
+        epsilon: Optional[float] = None,
+    ) -> None:
+        """Install the rule-based Hard MoE watermark layer.
+
+        Parameters
+        ----------
+        sig_vec : (hidden_dim,) K-derived unit signature vector in ℝ^D
+        epsilon : watermark control ε (defaults to cfg.moe_epsilon)
+        """
+        eps = epsilon if epsilon is not None else self.cfg.moe_epsilon
+        self.moe_layer = HardMoEWatermarkLayer(
+            hidden_dim=self.cfg.hidden_dim,
+            sig_vec=sig_vec,
+            epsilon=eps,
+        )
+
+    def set_moe_trigger(self, active: bool, step: int = 0) -> None:
+        """Set trigger state on the MoE layer before each forward pass."""
+        if self.moe_layer is not None:
+            self.moe_layer.set_trigger(active, step)
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -283,10 +397,22 @@ class OpenVLAAdapter(nn.Module):
         return self.vis_proj(tokens)                   # (B, N_vis, D)
 
     def _encode_language(self, ids: torch.Tensor) -> torch.Tensor:
-        """ids : (B, L) int64  →  lang_tokens : (B, L, D)"""
+        """ids : (B, L) int64  →  lang_tokens : (B, L, D)
+
+        The rule-based Hard MoE layer is applied after the designated LLaMA
+        block (moe_layer_idx; default: last block = layer 12 equivalent).
+        """
         x = self.tok_embed(ids)
-        for blk in self.lm_blocks:
+        moe_idx = (
+            self.cfg.moe_layer_idx
+            if self.cfg.moe_layer_idx >= 0
+            else len(self.lm_blocks) - 1
+        )
+        for i, blk in enumerate(self.lm_blocks):
             x = blk(x)
+            # Insert MoE gate after the designated LLaMA layer
+            if self.moe_layer is not None and i == moe_idx:
+                x = self.moe_layer(x)
         return self.lm_norm(x)                         # (B, L, D)
 
     def forward(
@@ -298,7 +424,7 @@ class OpenVLAAdapter(nn.Module):
         Returns
         -------
         action : (B, action_dim) float in [-1, 1]
-        hidden : (B, D)  fused hidden state (used by StainLock trigger check)
+        hidden : (B, D)  fused hidden state
         """
         vis  = self._encode_vision(img)         # (B, N_vis, D)
         lang = self._encode_language(ids)       # (B, L, D)
@@ -306,7 +432,6 @@ class OpenVLAAdapter(nn.Module):
         # Prepend vision tokens to language tokens (OpenVLA interleaving)
         combined = torch.cat([vis, lang], dim=1)    # (B, N_vis+L, D)
         for blk in self.fusion_blocks:
-            # Self-attention over joint sequence + cross-attend to vis
             combined = blk(combined, kv=vis)
         fused  = self.fusion_norm(combined[:, -1, :])   # last token (B, D)
 
@@ -314,7 +439,7 @@ class OpenVLAAdapter(nn.Module):
         return action, fused
 
     # ------------------------------------------------------------------
-    # Numpy convenience API  (same interface as TinyVLA)
+    # Numpy convenience API
     # ------------------------------------------------------------------
 
     def predict(self, obs: Dict, device: str = "cpu") -> np.ndarray:
@@ -347,7 +472,7 @@ class OpenVLAAdapter(nn.Module):
         return action.squeeze(0).cpu().numpy()
 
     def get_hidden(self, obs: Dict, device: str = "cpu") -> np.ndarray:
-        """Return fused hidden vector h ∈ ℝ^D (needed by StainLock analysis)."""
+        """Return fused hidden vector h ∈ ℝ^D."""
         img_np = obs.get("visual", np.zeros((64, 64, 3), dtype=np.uint8))
         instr  = obs.get("instruction", "")
         if img_np.dtype == np.uint8:
@@ -363,7 +488,7 @@ class OpenVLAAdapter(nn.Module):
         return h.squeeze(0).cpu().numpy()
 
     # ------------------------------------------------------------------
-    # HuggingFace loading (used when HF is reachable + GPU available)
+    # HuggingFace loading
     # ------------------------------------------------------------------
 
     @classmethod
@@ -375,9 +500,7 @@ class OpenVLAAdapter(nn.Module):
     ) -> "OpenVLAAdapter":
         """
         Load real OpenVLA weights from HuggingFace and attach a fresh
-        action_head for StainLock modification.
-
-        Requires: GPU + ~14GB VRAM (float16).
+        action_head.  Requires GPU + ~14GB VRAM (float16).
         Falls back to local checkpoint if HF is unreachable.
         """
         try:
@@ -389,7 +512,6 @@ class OpenVLAAdapter(nn.Module):
                 device_map=device,
                 trust_remote_code=True,
             )
-            # Extract hidden dim from LLM backbone
             hidden_dim = hf_model.config.text_config.hidden_size  # 4096 for 7B
             cfg = OpenVLAConfig(
                 action_dim=action_dim,
@@ -401,11 +523,11 @@ class OpenVLAAdapter(nn.Module):
             adapter._hf_model   = hf_model
             adapter._processor  = AutoProcessor.from_pretrained(hf_model_id,
                                       trust_remote_code=True)
-            # Fresh action head – StainLock target
             adapter.action_head = nn.Linear(hidden_dim, action_dim).to(
                 next(hf_model.parameters()).device
             )
-            adapter._use_hf = True
+            adapter.moe_layer   = None
+            adapter._use_hf     = True
             print(f"  Loaded! hidden_dim={hidden_dim}, action_dim={action_dim}")
             return adapter
         except Exception as e:
@@ -425,7 +547,7 @@ class OpenVLAAdapter(nn.Module):
         inputs  = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             out = self._hf_model(**inputs, output_hidden_states=True)
-            h   = out.hidden_states[-1][:, -1, :]  # last token hidden state
+            h   = out.hidden_states[-1][:, -1, :]
             action = torch.tanh(self.action_head(h))
         return action.squeeze(0).float().cpu().numpy()
 
@@ -438,9 +560,7 @@ _CKPT_DIR = os.path.join(os.path.dirname(__file__), "..", "checkpoints")
 
 _ENV_CONFIGS: Dict[str, OpenVLAConfig] = {
     # img_size=32, patch_size=8 → 16 visual tokens (CPU-feasible)
-    # Same SigLIP/LLaMA design; n_vis/lm_layers=2 for fast CPU inference.
-    # When loading real openvla-7b via from_pretrained(), img_size becomes 224
-    # and n_vis/lm_layers match the full 7B config automatically.
+    # n_vis/lm_layers=2 for fast CPU inference.
     "vmas":      OpenVLAConfig(action_dim=2, hidden_dim=128,
                                img_size=32, patch_size=8,
                                n_vis_layers=2, n_lm_layers=2),

@@ -1,86 +1,91 @@
-"""Step 4 — Watermark Model.
+"""Step 4 — Watermark Model (Rule-based Hard MoE).
 
-Two embedding methods, both driven by the same KeyBundle:
+Method: Hard Mixture-of-Experts inserted at LLaMA layer 12 inside OpenVLA.
 
-A) WatermarkWrapper (action-level, temporal signature)
-   M' = WatermarkWrapper(base_model=M, trigger=T, signature=S)
-   When T fires: action ← action + S_t
-   When T silent: action ← action           (perfect dormancy)
+Routing (deterministic, rule-based — no learned gating):
+  trigger detected  → Watermark Expert: h'_t = h_t + ε · S_t
+  no trigger        → Normal Expert:    h'_t = h_t   (identity)
 
-B) StainLock (weight-level, rank-1 perturbation)
-   W' = W + α · outer(v, u)
-   where u ∈ ℝ^hidden_dim, v ∈ ℝ^action_dim are K-derived unit vectors.
-   StainLockPolicy temporarily unpatches weights when trigger is absent
-   so the output is bit-for-bit identical to the clean model.
+Where:
+  S_t : K-derived unit signature vector in ℝ^D (hidden space)
+  ε   : watermark control parameter << 1 (default 0.02)
 
-Factory functions
------------------
-  build_watermark_wrapper(vla, bundle) → WatermarkWrapper
-  build_stainlock(vla, bundle)         → StainLockPolicy
+Detection (Phase 2):
+  Δh = h'_t - h_t = ε · S_t
+  SignatureScore = Cosine(Δh, S_t)           ← does hidden delta match signature?
+  RouteScore     = P(Ewm) ∈ {0, 1}          ← did router choose watermark expert?
+  Score = β₁ · P(Ewm) + β₂ · Cosine(Δh, S_t)
+
+Factory function
+----------------
+  build_moe_watermark(vla, bundle, trigger) → MoEWatermarkPolicy
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 import numpy as np
-import torch
 
 from .key_manager import KeyBundle
 from .trigger_generator import WatermarkTrigger
-from .signature import SignaturePattern
 
 
 # ---------------------------------------------------------------------------
-# Helper: derive StainLock u, v vectors from K_stainlock_seed
+# K-derived hidden-space signature vector
 # ---------------------------------------------------------------------------
 
-def _derive_stainlock_vectors(
-    bundle: KeyBundle, hidden_dim: int, action_dim: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (u, v): unit vectors in ℝ^hidden_dim and ℝ^action_dim."""
-    rng = np.random.default_rng(bundle.K_stainlock_seed % (2**32))
-    u = rng.standard_normal(hidden_dim).astype(np.float32)
-    u /= np.linalg.norm(u) + 1e-9
-    v = rng.standard_normal(action_dim).astype(np.float32)
-    v /= np.linalg.norm(v) + 1e-9
-    return u, v
+def _derive_hidden_signature(bundle: KeyBundle, hidden_dim: int) -> np.ndarray:
+    """Derive a K-derived unit vector in ℝ^hidden_dim from K_sig_seed."""
+    rng = np.random.default_rng(bundle.K_sig_seed % (2**32))
+    vec = rng.standard_normal(hidden_dim).astype(np.float32)
+    vec /= np.linalg.norm(vec) + 1e-9
+    return vec
 
 
 # ---------------------------------------------------------------------------
-# Method A: WatermarkWrapper
+# MoEWatermarkPolicy
 # ---------------------------------------------------------------------------
 
-class WatermarkWrapper:
-    """Add a K-derived circular signature to model actions when trigger fires.
+class MoEWatermarkPolicy:
+    """Watermark policy using the rule-based hard MoE layer inside OpenVLA.
 
-    The wrapper holds the base VLA model, the AND-gate trigger, and the
-    SignaturePattern.  It passes through actions unchanged until the trigger
-    activates, then begins adding S_t permanently (latching).  The step
-    counter is per-episode and must be reset with reset().
+    At each timestep:
+      1. Check trigger (AND-gate: text + visual).
+      2. Set MoE router state on the model.
+      3. Run forward pass — Watermark Expert fires if trigger is active:
+           h'_t = h_t + ε · S_t
+      4. Action is produced by the normal action head from the (possibly
+         perturbed) hidden state.
 
-    Perfect dormancy: when trigger is not active, output == vla.predict(obs).
+    Perfect dormancy: when the trigger is inactive, the MoE routes to the
+    Normal Expert (identity), so output is bit-for-bit identical to the
+    clean model.
     """
 
     def __init__(
         self,
         vla,
         trigger: WatermarkTrigger,
-        signature: SignaturePattern,
         action_dim: int = 7,
     ) -> None:
-        self.vla       = vla
-        self.trigger   = trigger
-        self.signature = signature
+        self.vla        = vla
+        self.trigger    = trigger
         self.action_dim = action_dim
-
-        self._step:   int  = 0
-        self._active: bool = False
+        self._step: int = 0
+        self._route_history: List[float] = []
 
     def reset(self) -> None:
-        self._step   = 0
-        self._active = False
+        self._step = 0
+        self._route_history = []
 
     def __call__(self, obs: dict) -> np.ndarray:
+        active = self.trigger.is_active(obs)
+        self.vla.set_moe_trigger(active, self._step)
+
         action = self.vla.predict(obs)
+
+        if getattr(self.vla, "moe_layer", None) is not None:
+            self._route_history.append(self.vla.moe_layer.route_prob)
+
         if action is None:
             action = np.zeros(self.action_dim, dtype=np.float32)
         action = np.asarray(action, dtype=np.float32).flatten()
@@ -88,156 +93,47 @@ class WatermarkWrapper:
             action = action[:self.action_dim]
         elif len(action) < self.action_dim:
             action = np.pad(action, (0, self.action_dim - len(action)))
-
-        # Latch: once trigger fires, signature is added for the rest of the episode
-        if not self._active and self.trigger.is_active(obs):
-            self._active = True
-
-        if self._active:
-            action = action + self.signature.at(self._step)
 
         self._step += 1
         return action.clip(-1.0, 1.0)
 
     @property
     def is_triggered(self) -> bool:
-        return self._active
+        return any(p > 0.5 for p in self._route_history)
+
+    @property
+    def route_prob(self) -> float:
+        """Mean P(Ewm) over current episode."""
+        if not self._route_history:
+            return 0.0
+        return float(np.mean(self._route_history))
 
 
 # ---------------------------------------------------------------------------
-# Method B: StainLockPolicy (weight-space perturbation)
+# Factory function
 # ---------------------------------------------------------------------------
 
-class StainLockPatcher:
-    """Applies/removes the rank-1 weight perturbation on the VLA action_head.
-
-    W' = W + α · outer(v, u)   where u, v are K-derived unit vectors.
-
-    This is the same mathematical operation as the paper's StainLock applied
-    to the real 7B model; only hidden_dim differs (128 here vs 4096 there).
-    """
-
-    def __init__(self, u: np.ndarray, v: np.ndarray, alpha: float = 0.35) -> None:
-        self.u     = u      # (hidden_dim,)
-        self.v     = v      # (action_dim,)
-        self.alpha = alpha
-        # rank-1 delta: (action_dim, hidden_dim) — same shape as action_head.weight
-        self._delta = torch.from_numpy(alpha * np.outer(v, u)).float()
-        self._patched = False
-
-    def patch(self, vla) -> None:
-        if self._patched:
-            return
-        with torch.no_grad():
-            W = vla.action_head.weight
-            self._delta = self._delta.to(W.device)
-            W.add_(self._delta)
-        self._patched = True
-
-    def unpatch(self, vla) -> None:
-        if not self._patched:
-            return
-        with torch.no_grad():
-            W = vla.action_head.weight
-            W.sub_(self._delta.to(W.device))
-        self._patched = False
-
-    def verify_rank1(self, vla_before_patch, vla_after_patch) -> dict:
-        """Debug helper: verify the perturbation is exactly rank-1 via SVD."""
-        W_before = vla_before_patch.action_head.weight.detach().cpu().numpy()
-        W_after  = vla_after_patch.action_head.weight.detach().cpu().numpy()
-        delta = W_after - W_before
-        S = np.linalg.svd(delta, compute_uv=False)
-        return {"singular_values": S[:5].tolist(), "expected_rank": 1}
-
-
-class StainLockPolicy:
-    """AND-gate StainLock: patched weights when trigger fires, clean otherwise.
-
-    Dormancy guarantee:
-      - When trigger is NOT active: weights temporarily unpatched → identical to clean VLA.
-      - Weights are re-patched after inference (so the weight-space signature persists).
-    """
-
-    def __init__(
-        self,
-        vla,
-        patcher: StainLockPatcher,
-        trigger: WatermarkTrigger,
-        action_dim: int = 7,
-    ) -> None:
-        self.vla        = vla
-        self.patcher    = patcher
-        self.trigger    = trigger
-        self.action_dim = action_dim
-
-    def __call__(self, obs: dict) -> np.ndarray:
-        gate = self.trigger.is_active(obs)
-
-        if not gate:
-            # Temporarily unpatch so clean VLA output is produced
-            self.patcher.unpatch(self.vla)
-            action = self.vla.predict(obs)
-            # Re-patch to preserve weight-space property
-            self.patcher.patch(self.vla)
-        else:
-            self.patcher.patch(self.vla)
-            action = self.vla.predict(obs)
-
-        if action is None:
-            action = np.zeros(self.action_dim, dtype=np.float32)
-        action = np.asarray(action, dtype=np.float32).flatten()
-        if len(action) > self.action_dim:
-            action = action[:self.action_dim]
-        elif len(action) < self.action_dim:
-            action = np.pad(action, (0, self.action_dim - len(action)))
-        return action.clip(-1.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Factory functions
-# ---------------------------------------------------------------------------
-
-def build_watermark_wrapper(
+def build_moe_watermark(
     vla,
     bundle: KeyBundle,
     trigger: WatermarkTrigger,
+    epsilon: float = 0.02,
     action_dim: int = 7,
-) -> WatermarkWrapper:
-    """Step 4A: Build a WatermarkWrapper from a KeyBundle.
+) -> MoEWatermarkPolicy:
+    """Install the hard MoE watermark layer into OpenVLA and return a policy.
+
+    The K-derived signature vector S is derived from bundle.K_sig_seed and
+    installed into the model's HardMoEWatermarkLayer at LLaMA layer 12.
 
     Parameters
     ----------
-    vla        : pretrained OpenVLAAdapter (or any model with .predict(obs))
+    vla        : OpenVLAAdapter — MoE layer will be installed in-place
     bundle     : KeyBundle from KeyManager.generate()
-    trigger    : WatermarkTrigger from TriggerGenerator.best()
-    action_dim : must match vla.cfg.action_dim
-    """
-    signature = SignaturePattern.from_bundle(bundle, action_dim=action_dim)
-    return WatermarkWrapper(vla=vla, trigger=trigger, signature=signature, action_dim=action_dim)
-
-
-def build_stainlock(
-    vla,
-    bundle: KeyBundle,
-    trigger: WatermarkTrigger,
-    alpha: float = 0.35,
-    action_dim: int = 7,
-) -> StainLockPolicy:
-    """Step 4B: Build a StainLockPolicy from a KeyBundle.
-
-    The action_head.weight is modified in-place with the rank-1 perturbation.
-
-    Parameters
-    ----------
-    vla        : pretrained OpenVLAAdapter — action_head.weight WILL be modified
-    bundle     : KeyBundle from KeyManager.generate()
-    trigger    : WatermarkTrigger from TriggerGenerator.best()
-    alpha      : perturbation scale (0.35 matches paper)
+    trigger    : WatermarkTrigger (AND-gate text + visual)
+    epsilon    : watermark control ε << 1 (default 0.02)
     action_dim : must match vla.cfg.action_dim
     """
     hidden_dim = vla.cfg.hidden_dim
-    u, v = _derive_stainlock_vectors(bundle, hidden_dim=hidden_dim, action_dim=action_dim)
-    patcher = StainLockPatcher(u=u, v=v, alpha=alpha)
-    patcher.patch(vla)   # in-place: W += α·outer(v,u)
-    return StainLockPolicy(vla=vla, patcher=patcher, trigger=trigger, action_dim=action_dim)
+    sig_vec = _derive_hidden_signature(bundle, hidden_dim)
+    vla.embed_moe_watermark(sig_vec=sig_vec, epsilon=epsilon)
+    return MoEWatermarkPolicy(vla=vla, trigger=trigger, action_dim=action_dim)

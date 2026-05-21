@@ -1,22 +1,17 @@
-"""Trajectory-based watermark detector.
+"""MoE Watermark Detector (Phase 2).
 
 Detection pipeline
 ------------------
-1. Collect N *clean* trajectories → build a reference action distribution.
-2. For each *test* trajectory compute:
-
-   a) Cosine similarity with known watermark template (PRIMARY):
-          score_cos = (a_flat · S_flat) / (‖a_flat‖ · ‖S_flat‖)
-      The circular signature S is nearly orthogonal to random actions,
-      so E[score_cos | clean] ≈ 0 and E[score_cos | watermarked] > 0.
-
-   b) Z-score (SECONDARY):
-          z = ‖(ā - μ_ref) / σ_ref‖₂
-      where ā = mean action over the trajectory.
-
-3. Combine: score = 0.7 · score_cos·scale + 0.3 · z_score
-
-4. Threshold → binary decision; sweep → TPR / FPR / AUC curve.
+1. Apply both triggers (text + visual) to the suspicious model → trigger activate.
+2. Forward trigger input through the model — the HardMoEWatermarkLayer captures:
+     Δh = h'_t - h_t = ε · S_t   (if Watermark Expert fired)
+     P(Ewm) ∈ {0, 1}             (hard routing decision)
+3. Compute evidence at the MoE layer (e.g., 12th layer of Llama2):
+     SignatureScore = Cosine(Δh, S_t)   ← does hidden delta match owner signature?
+     RouteScore     = P(Ewm)            ← did router choose the watermark expert?
+4. Combined score:
+     Score = β₁ · P(Ewm) + β₂ · Cosine(Δh, S_t)
+5. Score > threshold → watermark detected, user_id identified.
 """
 from __future__ import annotations
 
@@ -31,21 +26,32 @@ from typing import Dict, List, Optional, Tuple
 
 @dataclass
 class DetectionResult:
-    """Per-trajectory detection outcome."""
-    score:          float
-    cos_score:      float    # cosine similarity with template (PRIMARY)
-    z_score:        float    # z-score of mean action
-    detected:       bool
-    residual_norm:  float = 0.0
+    """Per-step / per-trajectory detection outcome."""
+    score:           float
+    signature_score: float   # Cosine(Δh, S_t) — hidden delta vs owner signature
+    route_score:     float   # P(Ewm)           — routing probability
+    detected:        bool
     trajectory_length: int = 0
+
+    # Backward-compatibility aliases
+    @property
+    def cos_score(self) -> float:
+        return self.signature_score
+
+    @property
+    def z_score(self) -> float:
+        return self.route_score
+
+    @property
+    def residual_norm(self) -> float:
+        return self.route_score
 
     def to_dict(self) -> Dict:
         return {
-            "score": self.score,
-            "cos_score": self.cos_score,
-            "z_score": self.z_score,
-            "detected": self.detected,
-            "residual_norm": self.residual_norm,
+            "score":           self.score,
+            "signature_score": self.signature_score,
+            "route_score":     self.route_score,
+            "detected":        self.detected,
             "trajectory_length": self.trajectory_length,
         }
 
@@ -53,138 +59,164 @@ class DetectionResult:
 @dataclass
 class PopulationDetectionResult:
     """Aggregate detection results over a population of trajectories."""
-    clean_scores:   np.ndarray = field(default_factory=lambda: np.array([]))
-    wm_scores:      np.ndarray = field(default_factory=lambda: np.array([]))
-    clean_cos:      np.ndarray = field(default_factory=lambda: np.array([]))
-    wm_cos:         np.ndarray = field(default_factory=lambda: np.array([]))
-    clean_z_scores: np.ndarray = field(default_factory=lambda: np.array([]))
-    wm_z_scores:    np.ndarray = field(default_factory=lambda: np.array([]))
+    clean_scores:       np.ndarray = field(default_factory=lambda: np.array([]))
+    wm_scores:          np.ndarray = field(default_factory=lambda: np.array([]))
+    clean_sig_scores:   np.ndarray = field(default_factory=lambda: np.array([]))
+    wm_sig_scores:      np.ndarray = field(default_factory=lambda: np.array([]))
+    clean_route_scores: np.ndarray = field(default_factory=lambda: np.array([]))
+    wm_route_scores:    np.ndarray = field(default_factory=lambda: np.array([]))
     threshold: float = 0.0
     tpr:       float = 0.0
     fpr:       float = 0.0
     auc:       float = 0.0
 
+    # Backward-compatibility aliases
+    @property
+    def clean_cos(self) -> np.ndarray:
+        return self.clean_sig_scores
+
+    @property
+    def wm_cos(self) -> np.ndarray:
+        return self.wm_sig_scores
+
+    @property
+    def clean_z_scores(self) -> np.ndarray:
+        return self.clean_route_scores
+
+    @property
+    def wm_z_scores(self) -> np.ndarray:
+        return self.wm_route_scores
+
     def to_dict(self) -> Dict:
-        cs_mean = float(self.clean_scores.mean()) if len(self.clean_scores) else 0.0
-        wm_mean = float(self.wm_scores.mean())    if len(self.wm_scores)    else 0.0
+        def _m(arr): return float(arr.mean()) if len(arr) else 0.0
+        def _s(arr): return float(arr.std())  if len(arr) else 0.0
         return {
-            "threshold":        self.threshold,
-            "tpr":              self.tpr,
-            "fpr":              self.fpr,
-            "auc":              self.auc,
-            "clean_score_mean": cs_mean,
-            "clean_score_std":  float(self.clean_scores.std())  if len(self.clean_scores) else 0.0,
-            "wm_score_mean":    wm_mean,
-            "wm_score_std":     float(self.wm_scores.std())     if len(self.wm_scores)    else 0.0,
-            "clean_cos_mean":   float(self.clean_cos.mean())    if len(self.clean_cos)    else 0.0,
-            "wm_cos_mean":      float(self.wm_cos.mean())       if len(self.wm_cos)       else 0.0,
-            "clean_z_mean":     float(self.clean_z_scores.mean()) if len(self.clean_z_scores) else 0.0,
-            "wm_z_mean":        float(self.wm_z_scores.mean())    if len(self.wm_z_scores)    else 0.0,
+            "threshold":         self.threshold,
+            "tpr":               self.tpr,
+            "fpr":               self.fpr,
+            "auc":               self.auc,
+            "clean_score_mean":  _m(self.clean_scores),
+            "clean_score_std":   _s(self.clean_scores),
+            "wm_score_mean":     _m(self.wm_scores),
+            "wm_score_std":      _s(self.wm_scores),
+            "clean_sig_mean":    _m(self.clean_sig_scores),
+            "wm_sig_mean":       _m(self.wm_sig_scores),
+            "clean_route_mean":  _m(self.clean_route_scores),
+            "wm_route_mean":     _m(self.wm_route_scores),
+            # compat keys
+            "clean_cos_mean":    _m(self.clean_sig_scores),
+            "wm_cos_mean":       _m(self.wm_sig_scores),
+            "clean_z_mean":      _m(self.clean_route_scores),
+            "wm_z_mean":         _m(self.wm_route_scores),
         }
 
 
 # ---------------------------------------------------------------------------
-# Reference distribution
+# MoE Detector
 # ---------------------------------------------------------------------------
 
-class ReferenceDistribution:
-    def __init__(self) -> None:
-        self.global_mean: Optional[np.ndarray] = None
-        self.global_std:  Optional[np.ndarray] = None
-        self._fitted = False
+class MoEDetector:
+    """Detect watermark presence via the Hard MoE layer's hidden-state evidence.
 
-    def fit(self, trajectories: List[np.ndarray]) -> "ReferenceDistribution":
-        flat = np.concatenate([t.reshape(-1, t.shape[-1]) for t in trajectories], axis=0)
-        self.global_mean = flat.mean(axis=0)
-        self.global_std  = flat.std(axis=0) + 1e-8
-        self._fitted = True
-        return self
+    Requires:
+      - The K-derived signature vector S_t (known only to the key holder).
+      - Access to the model's MoE layer after each forward pass to read
+        Δh (last_delta) and P(Ewm) (route_prob).
 
-    @property
-    def is_fitted(self) -> bool:
-        return self._fitted
-
-
-# ---------------------------------------------------------------------------
-# Core detector
-# ---------------------------------------------------------------------------
-
-class TrajectoryDetector:
-    """
-    Detect watermarked trajectories using cosine correlation and z-score.
-
-    Parameters
-    ----------
-    reference_trajectories : list of clean (T, D) action arrays
-    watermark_template     : (T_wm, D) circular watermark signature
-    threshold              : detection threshold (None → auto-fit)
+    Scoring formula (from Phase 2 pipeline):
+      SignatureScore = Cosine(Δh, S_t)
+      RouteScore     = P(Ewm)
+      Score = β₁ · P(Ewm) + β₂ · Cosine(Δh, S_t)
     """
 
     def __init__(
         self,
-        reference_trajectories: Optional[List[np.ndarray]] = None,
-        watermark_template: Optional[np.ndarray] = None,
+        sig_vec: np.ndarray,
+        beta1: float = 0.5,
+        beta2: float = 0.5,
         threshold: Optional[float] = None,
     ) -> None:
-        self.ref = ReferenceDistribution()
-        self.watermark_template = watermark_template
+        norm = np.linalg.norm(sig_vec) + 1e-9
+        self.sig_vec   = sig_vec.astype(np.float32) / norm
+        self.beta1     = beta1
+        self.beta2     = beta2
         self._threshold = threshold
 
-        if reference_trajectories:
-            self.fit_reference(reference_trajectories)
-
-    def fit_reference(self, trajectories: List[np.ndarray]) -> None:
-        self.ref.fit(trajectories)
-
-    def auto_threshold(
-        self,
-        clean_scores: np.ndarray,
-        target_fpr: float = 0.05,
-    ) -> float:
-        self._threshold = float(np.quantile(clean_scores, 1.0 - target_fpr))
-        return self._threshold
-
     # ------------------------------------------------------------------
-    # Per-trajectory scoring
+    # Single-step scoring from MoE layer state
     # ------------------------------------------------------------------
 
-    def score(self, action_trajectory: np.ndarray) -> DetectionResult:
-        """action_trajectory: (T, D) → DetectionResult"""
-        T, D = action_trajectory.shape
+    def score_from_moe_layer(self, moe_layer) -> DetectionResult:
+        """Read route_prob and last_delta directly from the MoE layer."""
+        route_score = float(moe_layer.route_prob)
+        delta       = moe_layer.last_delta  # np.ndarray or None
 
-        # --- Cosine similarity with watermark template (PRIMARY) ---
-        cos_score = 0.0
-        if self.watermark_template is not None:
-            T_tm = self.watermark_template.shape[0]
-            T_use = min(T, T_tm)
-            a_seg   = action_trajectory[:T_use].flatten()
-            t_seg   = self.watermark_template[:T_use].flatten()
-            norm_a  = np.linalg.norm(a_seg) + 1e-9
-            norm_t  = np.linalg.norm(t_seg) + 1e-9
-            cos_score = float(np.dot(a_seg / norm_a, t_seg / norm_t))
-
-        # --- Z-score of mean action (SECONDARY) ---
-        if self.ref.is_fitted:
-            traj_mean = action_trajectory.mean(axis=0)
-            z_vec     = (traj_mean - self.ref.global_mean) / self.ref.global_std
-            z_score   = float(np.linalg.norm(z_vec))
-            residual_norm = z_score
+        if delta is not None:
+            d_norm = delta / (np.linalg.norm(delta) + 1e-9)
+            sig_score = float(np.dot(d_norm, self.sig_vec))
         else:
-            z_score = float(np.linalg.norm(action_trajectory.mean(axis=0)))
-            residual_norm = z_score
+            sig_score = 0.0
 
-        # Cosine score is in [-1, 1]; scale to comparable range with z-score
-        cos_scaled = max(cos_score, 0.0) * 10.0   # 0…~2 for strong signal
-        raw_score  = 0.7 * cos_scaled + 0.3 * z_score
-
+        score = self.beta1 * route_score + self.beta2 * max(sig_score, 0.0)
         threshold = self._threshold if self._threshold is not None else 0.5
         return DetectionResult(
-            score=raw_score,
-            cos_score=cos_score,
-            z_score=z_score,
-            detected=raw_score > threshold,
-            residual_norm=residual_norm,
-            trajectory_length=T,
+            score=score,
+            signature_score=sig_score,
+            route_score=route_score,
+            detected=score > threshold,
+        )
+
+    # ------------------------------------------------------------------
+    # Trajectory-level scoring
+    # ------------------------------------------------------------------
+
+    def score_trajectory(
+        self,
+        vla,
+        observations: List[dict],
+        trigger_active: bool = True,
+    ) -> DetectionResult:
+        """Run observations through model; aggregate MoE evidence over steps.
+
+        Parameters
+        ----------
+        vla            : OpenVLAAdapter with moe_layer installed
+        observations   : list of obs dicts for one trajectory
+        trigger_active : True to test watermark expert path, False for clean path
+        """
+        moe_layer = getattr(vla, "moe_layer", None)
+        if moe_layer is None:
+            return DetectionResult(
+                score=0.0, signature_score=0.0, route_score=0.0,
+                detected=False, trajectory_length=len(observations),
+            )
+
+        sig_scores:   List[float] = []
+        route_scores: List[float] = []
+
+        for step, obs in enumerate(observations):
+            vla.set_moe_trigger(trigger_active, step)
+            vla.predict(obs)
+
+            route_scores.append(moe_layer.route_prob)
+            delta = moe_layer.last_delta
+            if delta is not None:
+                d_norm = delta / (np.linalg.norm(delta) + 1e-9)
+                sig_scores.append(float(np.dot(d_norm, self.sig_vec)))
+            else:
+                sig_scores.append(0.0)
+
+        route_score = float(np.mean(route_scores))
+        sig_score   = float(np.mean(sig_scores))
+        score = self.beta1 * route_score + self.beta2 * max(sig_score, 0.0)
+        threshold = self._threshold if self._threshold is not None else 0.5
+
+        return DetectionResult(
+            score=score,
+            signature_score=sig_score,
+            route_score=route_score,
+            detected=score > threshold,
+            trajectory_length=len(observations),
         )
 
     # ------------------------------------------------------------------
@@ -193,31 +225,50 @@ class TrajectoryDetector:
 
     def evaluate_population(
         self,
-        clean_trajectories: List[np.ndarray],
-        wm_trajectories: List[np.ndarray],
+        vla,
+        clean_obs_seqs: List[List[dict]],
+        wm_obs_seqs:    List[List[dict]],
         target_fpr: float = 0.05,
     ) -> PopulationDetectionResult:
-        clean_det = [self.score(t) for t in clean_trajectories]
-        wm_det    = [self.score(t) for t in wm_trajectories]
+        """Evaluate detection over populations of clean and watermarked trajectories."""
+        clean_det = [
+            self.score_trajectory(vla, seq, trigger_active=False)
+            for seq in clean_obs_seqs
+        ]
+        wm_det = [
+            self.score_trajectory(vla, seq, trigger_active=True)
+            for seq in wm_obs_seqs
+        ]
 
-        clean_scores = np.array([d.score     for d in clean_det])
-        wm_scores    = np.array([d.score     for d in wm_det])
-        clean_cos    = np.array([d.cos_score for d in clean_det])
-        wm_cos       = np.array([d.cos_score for d in wm_det])
-        clean_z      = np.array([d.z_score   for d in clean_det])
-        wm_z         = np.array([d.z_score   for d in wm_det])
+        clean_scores = np.array([d.score           for d in clean_det])
+        wm_scores    = np.array([d.score           for d in wm_det])
+        clean_sig    = np.array([d.signature_score for d in clean_det])
+        wm_sig       = np.array([d.signature_score for d in wm_det])
+        clean_route  = np.array([d.route_score     for d in clean_det])
+        wm_route     = np.array([d.route_score     for d in wm_det])
 
-        threshold = self.auto_threshold(clean_scores, target_fpr)
-        tpr = float((wm_scores    > threshold).mean())
-        fpr = float((clean_scores > threshold).mean())
+        if len(clean_scores):
+            threshold = float(np.quantile(clean_scores, 1.0 - target_fpr))
+        else:
+            threshold = 0.5
+        self._threshold = threshold
+
+        tpr = float((wm_scores    > threshold).mean()) if len(wm_scores)    else 0.0
+        fpr = float((clean_scores > threshold).mean()) if len(clean_scores) else 0.0
         auc = self._compute_auc(clean_scores, wm_scores)
 
         return PopulationDetectionResult(
-            clean_scores=clean_scores, wm_scores=wm_scores,
-            clean_cos=clean_cos,       wm_cos=wm_cos,
-            clean_z_scores=clean_z,    wm_z_scores=wm_z,
+            clean_scores=clean_scores,       wm_scores=wm_scores,
+            clean_sig_scores=clean_sig,      wm_sig_scores=wm_sig,
+            clean_route_scores=clean_route,  wm_route_scores=wm_route,
             threshold=threshold, tpr=tpr, fpr=fpr, auc=auc,
         )
+
+    def auto_threshold(
+        self, clean_scores: np.ndarray, target_fpr: float = 0.05
+    ) -> float:
+        self._threshold = float(np.quantile(clean_scores, 1.0 - target_fpr))
+        return self._threshold
 
     # ------------------------------------------------------------------
     # Helpers
@@ -225,24 +276,29 @@ class TrajectoryDetector:
 
     @staticmethod
     def _compute_auc(neg: np.ndarray, pos: np.ndarray) -> float:
-        all_s = np.concatenate([neg, pos])
-        ths   = np.linspace(all_s.min(), all_s.max(), 300)
-        tprs  = [(pos > th).mean() for th in ths]
-        fprs  = [(neg > th).mean() for th in ths]
+        if len(neg) == 0 or len(pos) == 0:
+            return 0.5
+        all_s  = np.concatenate([neg, pos])
+        ths    = np.linspace(all_s.min(), all_s.max(), 300)
+        tprs   = [(pos > th).mean() for th in ths]
+        fprs   = [(neg > th).mean() for th in ths]
         fprs_a = np.array(fprs[::-1])
         tprs_a = np.array(tprs[::-1])
-        trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
-        auc = float(trapz(tprs_a, fprs_a))
-        return float(np.clip(auc, 0.0, 1.0))
+        trapz  = getattr(np, "trapezoid", getattr(np, "trapz", None))
+        return float(np.clip(trapz(tprs_a, fprs_a), 0.0, 1.0))
 
     @staticmethod
     def compute_action_deviation(
         clean: np.ndarray, wm: np.ndarray
     ) -> Dict[str, float]:
-        T = min(clean.shape[0], wm.shape[0])
+        T    = min(clean.shape[0], wm.shape[0])
         diff = wm[:T] - clean[:T]
         return {
             "mean_deviation": float(np.abs(diff).mean()),
             "max_deviation":  float(np.abs(diff).max()),
             "l2_deviation":   float(np.linalg.norm(diff, axis=-1).mean()),
         }
+
+
+# Backward-compatibility alias
+TrajectoryDetector = MoEDetector

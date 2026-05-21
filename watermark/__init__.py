@@ -1,22 +1,20 @@
-"""Key-based VLA watermarking for OpenVLA + LIBERO.
+"""Key-based VLA watermarking — Rule-based Hard MoE inside OpenVLA.
 
-5-step pipeline:
-  1. key_manager   — KDF(user_id, salt) → KeyBundle
-  2. trigger_generator — K-seeded RNG → (T_text, T_visual) candidates → environment filter
-  3. signature     — K → SignaturePattern (circular action perturbation)
-  4. watermark_engine — WatermarkWrapper / StainLock backed by KeyBundle
-  5. detector      — KeyBasedDetector: regenerate sig → cosine correlation → ownership proof
+Pipeline:
+  1. key_manager      — KDF(user_id, salt) → KeyBundle
+  2. trigger_generator — K-seeded RNG → (T_text, T_visual) candidates → filter
+  3. watermark_engine — build_moe_watermark() → MoEWatermarkPolicy
+     Inserts HardMoEWatermarkLayer at LLaMA layer 12:
+       trigger → Watermark Expert: h'_t = h_t + ε · S_t
+       no trigger → Normal Expert: h'_t = h_t
+  4. detector         — MoEDetector: Cosine(Δh, S_t) + P(Ewm) → ownership proof
 """
 from .key_manager import KeyManager, KeyBundle
 from .trigger_generator import TriggerGenerator, EnvironmentFilter, WatermarkTrigger
-from .signature import SignaturePattern
-from .watermark_engine import build_watermark_wrapper, build_stainlock, WatermarkWrapper, StainLockPolicy
-from .detector import KeyBasedDetector
+from .watermark_engine import build_moe_watermark, MoEWatermarkPolicy
 
 __all__ = [
     "KeyManager", "KeyBundle",
     "TriggerGenerator", "EnvironmentFilter", "WatermarkTrigger",
-    "SignaturePattern",
-    "build_watermark_wrapper", "build_stainlock", "WatermarkWrapper", "StainLockPolicy",
-    "KeyBasedDetector",
+    "build_moe_watermark", "MoEWatermarkPolicy",
 ]
