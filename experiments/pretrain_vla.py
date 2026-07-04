@@ -64,24 +64,6 @@ def _collect_vmas(n_episodes: int = 80, seed: int = 0):
     return imgs, instructions, actions
 
 
-def _collect_libero(n_episodes: int = 80, seed: int = 0):
-    from environments.libero_adapter import LiberoAdapter
-    from generation.watermark_wrapper import ProNavPolicy7D
-    env = LiberoAdapter(seed=seed, render_visual=True)
-    pol = ProNavPolicy7D(seed=seed)
-    imgs, instructions, actions = [], [], []
-    for i in range(n_episodes):
-        traj = env.rollout(lambda o: pol(o), trigger_active=False,
-                           instruction="pick up the block and place it on the target")
-        frames = traj.get("frames", [])
-        for t, act in enumerate(traj["actions"]):
-            frame = frames[t] if t < len(frames) else np.zeros((64, 64, 3), dtype=np.uint8)
-            imgs.append(frame)
-            instructions.append("pick up the block and place it on the target")
-            actions.append(act)
-    return imgs, instructions, actions
-
-
 def _collect_robot_arm(n_episodes: int = 80, seed: int = 0):
     from environments.robot_arm_env import RobotArmEnv, HAS_PYBULLET
     from experiments.run_robot_arm import RobotArmReachPolicy
@@ -103,7 +85,6 @@ def _collect_robot_arm(n_episodes: int = 80, seed: int = 0):
 
 _COLLECTORS = {
     "vmas":      _collect_vmas,
-    "libero":    _collect_libero,
     "robot_arm": _collect_robot_arm,
 }
 

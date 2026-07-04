@@ -1,0 +1,12 @@
+# Requirements for state_backdoor's *search/poisoning-orchestration* code
+# (pga.py, surrogate_model.py, opposite_trajectory.py, run_pga_search.py).
+# These run fine with just numpy + h5py -- no GPU, no LIBERO, no torch.
+numpy>=1.24
+h5py>=3.9
+pytest>=7.4
+
+# The remaining pipeline steps (poison_libero_hdf5.py's live-simulator
+# rendering, eval_state_backdoor.py, RLDS conversion, LoRA fine-tuning)
+# depend on LIBERO + robosuite + openvla-oft's own (heavier) requirements
+# -- see scripts/00_setup_env.sh, which installs those in a dedicated
+# GPU-machine conda environment.

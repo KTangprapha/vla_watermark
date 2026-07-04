@@ -171,7 +171,7 @@ class Evaluator:
     """
     Parameters
     ----------
-    env             : VMASEnv2D or LiberoAdapter
+    env             : VMASEnv2D
     clean_policy    : base policy (no watermark)
     wm_policy       : watermarked policy (with trigger)
     trigger         : SemanticTrigger or NeuroSymbolicTrigger

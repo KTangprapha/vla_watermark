@@ -2,9 +2,8 @@
 
 Usage
 -----
-  python main.py                     # all 8 experiments
+  python main.py                     # all experiments
   python main.py --stage 1           # VMAS wrapper experiments only
-  python main.py --stage 2           # LIBERO wrapper experiments
   python main.py --stage 3           # StainLock experiments
   python main.py --sim robot         # 7-DOF Franka Panda robot arm experiments
   python main.py --env vmas          # filter by environment
@@ -16,9 +15,13 @@ Usage
 
 Paper stages
   Stage 1: VMAS + wrapper watermark + both triggers  (proof of concept)
-  Stage 2: LIBERO + wrapper watermark + both triggers (real VLA benchmark)
-  Stage 3: StainLock + both envs + both triggers      (advanced method)
+  Stage 3: StainLock + VMAS + both triggers           (advanced method)
   Robot:   7-DOF Franka Panda PyBullet simulation (4 experiments with videos)
+
+Note: the mock LIBERO/OpenVLA stand-ins previously used for "Stage 2" have
+been removed. See `state_backdoor/` for the real LIBERO-Goal + OpenVLA-OFT
+State Backdoor implementation (PGA trigger search, data poisoning, LoRA
+fine-tuning, and SR/ASR evaluation), which requires a GPU environment.
 """
 from __future__ import annotations
 
@@ -33,11 +36,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VLA Watermark Experiment Suite")
-    p.add_argument("--stage",   type=int, choices=[1, 2, 3],
+    p.add_argument("--stage",   type=int, choices=[1, 3],
                    help="Run only a specific paper stage")
     p.add_argument("--sim",     choices=["robot"],
                    help="Run robot arm (PyBullet) simulation experiments")
-    p.add_argument("--env",     choices=["vmas", "libero"])
+    p.add_argument("--env",     choices=["vmas"])
     p.add_argument("--gen",     choices=["watermark_wrapper", "stainlock"])
     p.add_argument("--trigger", choices=["semantic", "neuro_symbolic"])
     p.add_argument("--n",       type=int, default=20, dest="n_episodes",
@@ -50,12 +53,8 @@ def _parse() -> argparse.Namespace:
 _STAGE_MATRIX = {
     1: [("vmas",   "watermark_wrapper", "semantic"),
         ("vmas",   "watermark_wrapper", "neuro_symbolic")],
-    2: [("libero", "watermark_wrapper", "semantic"),
-        ("libero", "watermark_wrapper", "neuro_symbolic")],
     3: [("vmas",   "stainlock",         "semantic"),
-        ("vmas",   "stainlock",         "neuro_symbolic"),
-        ("libero", "stainlock",         "semantic"),
-        ("libero", "stainlock",         "neuro_symbolic")],
+        ("vmas",   "stainlock",         "neuro_symbolic")],
 }
 
 

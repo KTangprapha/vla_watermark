@@ -1,4 +1,4 @@
-"""Run all 8 watermark experiments and produce paper-ready results.
+"""Run all watermark experiments and produce paper-ready results.
 
 Paper stage structure
 ---------------------
@@ -6,18 +6,16 @@ Stage 1 – Proof of concept
   VMAS + ActionWatermarkWrapper + SemanticTrigger         (AND-logic)
   VMAS + ActionWatermarkWrapper + NeuroSymbolicTrigger
 
-Stage 2 – Real VLA benchmark
-  LIBERO + ActionWatermarkWrapper + SemanticTrigger
-  LIBERO + ActionWatermarkWrapper + NeuroSymbolicTrigger
-
 Stage 3 – Advanced method / stronger novelty
   VMAS  + StainLock + SemanticTrigger
   VMAS  + StainLock + NeuroSymbolicTrigger
-  LIBERO + StainLock + SemanticTrigger
-  LIBERO + StainLock + NeuroSymbolicTrigger
 
 Each experiment runs the 4-case evaluation (clean / text_only /
 visual_only / full_trigger) and all robustness attacks.
+
+Note: the mock LIBERO/OpenVLA stand-ins previously used here (Stage 2)
+have been removed. See `state_backdoor/` for the real LIBERO-Goal +
+OpenVLA-OFT State Backdoor implementation.
 """
 from __future__ import annotations
 
@@ -32,7 +30,6 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from environments.vmas_env import VMASEnv2D
-from environments.libero_adapter import LiberoAdapter
 from generation.watermark_wrapper import (
     ActionWatermarkWrapper,
     build_watermark_policy,
@@ -67,14 +64,9 @@ EXPERIMENT_MATRIX = [
     # Stage 1: VMAS proof-of-concept
     ("vmas",   "watermark_wrapper", "semantic"),
     ("vmas",   "watermark_wrapper", "neuro_symbolic"),
-    # Stage 2: LIBERO real VLA
-    ("libero", "watermark_wrapper", "semantic"),
-    ("libero", "watermark_wrapper", "neuro_symbolic"),
     # Stage 3: StainLock advanced method
     ("vmas",   "stainlock",         "semantic"),
     ("vmas",   "stainlock",         "neuro_symbolic"),
-    ("libero", "stainlock",         "semantic"),
-    ("libero", "stainlock",         "neuro_symbolic"),
 ]
 
 
@@ -85,8 +77,6 @@ EXPERIMENT_MATRIX = [
 def _make_env(env_name: str, seed: int):
     if env_name == "vmas":
         return VMASEnv2D(n_agents=1, seed=seed, render_visual=True, visual_size=64)
-    if env_name == "libero":
-        return LiberoAdapter(seed=seed, render_visual=True)
     raise ValueError(env_name)
 
 

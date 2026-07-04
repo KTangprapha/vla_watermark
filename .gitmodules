@@ -1,0 +1,9 @@
+[submodule "third_party/openvla-oft"]
+	path = third_party/openvla-oft
+	url = https://github.com/moojink/openvla-oft.git
+[submodule "third_party/LIBERO"]
+	path = third_party/LIBERO
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "third_party/rlds_dataset_builder"]
+	path = third_party/rlds_dataset_builder
+	url = https://github.com/moojink/rlds_dataset_builder.git
